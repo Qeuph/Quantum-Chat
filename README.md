@@ -1,198 +1,170 @@
-# Quantum-Chat
-As the name suggests!
-```markdown
-# 🛡️ Quantum P2P Chat – ML‑DSA‑87 + Kyber‑512
+# Quantum Chat
 
-A **fully functional, production‑ready** peer‑to‑peer chat application with **post‑quantum cryptography**.  
-Everything runs in a single Python file – no external services, no central servers, no placeholders.
+Quantum Chat is a single-file, browser-based, post-quantum encrypted peer-to-peer chat application. It includes a local web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, and small group fan-out.
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+> **Security note:** this project uses post-quantum primitives through `pqcrypto`, but it has not been independently audited. Treat it as production-oriented application code, not a certified secure messenger.
 
----
+## Features
 
-## ✨ Features
+- **Persistent identity:** your ML-DSA/Dilithium public/private signing key is created once and stored in SQLite.
+- **Trusted friends:** add peers by public key, optionally with a nickname.
+- **Post-quantum session setup:** peers authenticate handshakes with ML-DSA/Dilithium signatures and establish shared secrets with Kyber-512.
+- **Modern symmetric encryption:** every chat message and file payload is encrypted with AES-256-GCM using HKDF-derived session keys.
+- **P2P-style relay:** peers connect to a signaling WebSocket that only routes envelopes; message and file contents remain end-to-end encrypted.
+- **Encrypted files:** files are encrypted in transit, checksum verified on receipt, stored locally, and downloadable from the local UI.
+- **Groups:** create groups and send messages to members by encrypting a separate copy for each member's current pairwise session.
+- **SQLite persistence:** identity, friends, sessions, groups, messages, and file metadata persist across restarts.
+- **One-file app:** all Python, HTTP serving, WebSocket handling, and the browser UI live in `chat.py`.
 
-- 🔐 **Post‑Quantum Security** – Uses **ML‑DSA‑87 (Dilithium)** for digital signatures and **Kyber‑512** for key exchange (both NIST‑approved).
-- 🤝 **True P2P** – Direct WebSocket connection between peers after a lightweight signaling handshake.
-- 💾 **Persistence** – All messages, friends, groups, and file metadata are stored in **SQLite** – no data loss on restart.
-- 🌐 **Browser‑based UI** – A clean, responsive HTML interface served directly from the Python script.
-- 👥 **Friends & Groups** – Add friends by their Dilithium public key; create or join encrypted groups.
-- 📎 **File Sharing** – Send files with end‑to‑end encryption and signature verification.
-- 🔄 **Offline Support** – Undelivered messages are queued and delivered when the peer reconnects.
-- 🧰 **All in One File** – Copy, run, and share – no installation other than two `pip` packages.
+## Requirements
 
----
+- Python 3.10+
+- Packages listed in `requirements.txt`:
+  - `cryptography`
+  - `websockets`
+  - `pqcrypto`
 
-## 🚀 Quick Start
-
-### 1. Install dependencies
+Install dependencies:
 
 ```bash
-pip install pqcrypto websockets
+python -m pip install -r requirements.txt
 ```
 
-### 2. Run the application
+## Quick start on one machine
+
+Start a local node and a local signaling server together:
 
 ```bash
-python quantum_p2p_chat.py
+python chat.py --with-signaling
 ```
 
-Your default browser will open automatically at `http://localhost:8000`.
+Open the UI at:
 
-### 3. Connect with a friend
-
-- **Copy your Dilithium public key** (shown in the UI).
-- **Send it to your friend** (via any channel – signal, email, etc.).
-- **Your friend pastes your key** into the *Friend's public key* field and clicks **Add Friend**, then **Connect**.
-- Both sides perform a Kyber‑512 key exchange → **AES‑256 encrypted channel** → chat begins.
-
----
-
-## 📖 How It Works
-
-### Cryptographic Stack
-
-| Layer          | Algorithm         | Purpose                                 |
-|----------------|-------------------|-----------------------------------------|
-| **Signatures** | ML‑DSA‑87         | Identity verification, message integrity|
-| **Key Exchange**| Kyber‑512         | Shared secret for AES‑256 session key  |
-| **Encryption** | AES‑256 (CBC)     | Encrypts all messages and files         |
-
-### Networking Model
-
-1. **Signaling** – Both peers connect to a built‑in WebSocket server (`localhost:8765`) to exchange handshake messages.
-2. **Key Exchange** – Peers exchange Kyber‑512 public keys and derive a shared secret.
-3. **Direct P2P** – After handshake, all subsequent communication goes over the same WebSocket (direct peer‑to‑peer).
-4. **Group Communication** – Messages are broadcast to all group members using each member's individual encryption key (no central group key for simplicity – but can be extended).
-
-### Data Persistence
-
-- SQLite database `quantum_chat.db` stores:
-  - Friends (public keys + nicknames)
-  - Peer connection metadata (IP, port, shared secret)
-  - Groups and memberships
-  - All messages (with encryption flag)
-  - File metadata (storage path, size, etc.)
-- Files are saved on disk under `files/` with a unique ID.
-
----
-
-## 📋 Usage Guide
-
-### UI Overview
-
-| Section          | What you can do                                                     |
-|------------------|----------------------------------------------------------------------|
-| **Your Public Key** | Copy and share this with friends.                                  |
-| **Friends**      | Add friends by public key, then connect to them.                    |
-| **Groups**       | Create a new group (ID appears), or join an existing group by ID.   |
-| **Message Area** | See incoming/outgoing messages and file transfers.                  |
-| **Input**        | Send text messages or upload files (to a friend or to a group).     |
-
-### Commands (via UI)
-
-- `Add Friend` – Add a trusted peer's public key.
-- `Connect` – Initiate a P2P handshake with a friend.
-- `Create Group` – Generate a new group ID (automatically join).
-- `Join Group` – Enter a group ID to join an existing group.
-- `Send` – Send a text message (choose *Friend* or *Group*).
-- `📎 File` – Upload a file (encrypted, signed, and sent).
-
----
-
-## 🔧 Configuration
-
-All settings are at the top of the Python file:
-
-```python
-DB_FILE = "quantum_chat.db"
-SIGNALING_HOST = "0.0.0.0"
-SIGNALING_PORT = 8765
-HTTP_PORT = 8000
+```text
+http://127.0.0.1:8000
 ```
 
-You can change the ports, host binding, or database name before running.
+To run a second local node for testing, use different ports and a different database:
 
----
-
-## 🛠 Requirements
-
-- **Python 3.8+**
-- **pip packages**: `pqcrypto`, `websockets`, `cryptography`
-- **Operating System**: Windows, macOS, Linux (all tested)
-
-The `pqcrypto` package includes C‑based ML‑DSA and Kyber implementations – ensure you have a working C compiler if installing from source (pre‑compiled wheels are available for most platforms).
-
----
-
-## 📂 Project Structure (Single File)
-
-```
-quantum_p2p_chat.py
-├── Database (SQLite)
-├── QuantumCrypto (ML‑DSA‑87 + Kyber‑512 + AES)
-├── P2PNode (peer management, groups, file handling)
-├── WebSocketHandler (signaling + P2P)
-├── HTTP Server (serves UI + files)
-└── Embedded HTML/CSS/JS (browser interface)
+```bash
+python chat.py --db peer2.db --http-port 8001 --ui-ws-port 8767 --signaling-url ws://127.0.0.1:8766 --no-browser
 ```
 
-All code, UI, and configuration reside in **one file** – no additional HTML, CSS, or JavaScript files needed.
+Then open `http://127.0.0.1:8001` manually.
 
----
+## Multi-machine setup
 
-## 🧪 Testing
+Run the signaling server on a reachable host:
 
-Run the script on two different machines (or on the same machine with two browser tabs) to test P2P functionality.  
-Use **different public keys** for each instance.  
-Verify that messages, files, and groups work across both instances.
-
----
-
-## ⚠️ Limitations & Known Issues
-
-- **NAT Traversal** – This version assumes peers can reach each other directly (e.g., same LAN or public IPs). For real‑world P2P over the internet, a TURN/STUN server would be required.
-- **Group Encryption** – Groups currently broadcast messages using each member's individual AES key. A proper group key agreement (e.g., TreeKEM) is not implemented.
-- **Large Files** – Files are kept entirely in memory before being sent; consider streaming for >100 MB transfers.
-- **Multiple UI Tabs** – Only one browser tab per node is supported.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Areas for improvement:
-
-- Add STUN/TURN support for NAT traversal.
-- Implement group key agreement for true encrypted groups.
-- Add optional password protection for private keys.
-- Include a CLI mode for headless operation.
-
-Please open an issue or pull request on GitHub.
-
----
-
-## 📄 License
-
-This project is licensed under the **MIT License**.  
-You are free to use, modify, and distribute it as long as you include the original copyright notice.
-
----
-
-## 🙏 Acknowledgements
-
-- [pqcrypto](https://github.com/theQRL/pqcrypto) – Python bindings for ML‑DSA (Dilithium) and Kyber.
-- [websockets](https://github.com/aaugustin/websockets) – WebSocket implementation.
-- [cryptography](https://github.com/pyca/cryptography) – AES‑256 implementation.
-- NIST for standardizing ML‑DSA and Kyber.
-
----
-
-## 📬 Contact
-
-For questions, feature requests, or bug reports, open an issue on the [project repository](https://github.com/your-username/quantum-p2p-chat).
-
----
-
-**Enjoy quantum‑secure, serverless chat!** 🚀
+```bash
+python chat.py signal --host 0.0.0.0 --port 8766
 ```
+
+Run each peer and point it at that signaling server:
+
+```bash
+python chat.py --signaling-url ws://SIGNALING_HOST_OR_IP:8766
+```
+
+Each peer then:
+
+1. Copies their public key from **Your identity**.
+2. Shares it with the other peer through a trusted out-of-band channel.
+3. Adds the other peer in **Friends**.
+4. Clicks **Connect** to complete the Kyber session handshake.
+5. Sends messages or files after the secure session notice appears.
+
+## How it works
+
+### Cryptographic flow
+
+1. A peer creates a persistent ML-DSA/Dilithium identity keypair.
+2. When connecting to a friend, the initiator creates an ephemeral Kyber keypair and sends a signed `session_offer` through the signaling server.
+3. The responder verifies the signature, encapsulates a shared secret to the initiator's Kyber public key, stores an HKDF-derived AES-256-GCM key, and returns a signed `session_accept`.
+4. The initiator verifies the acceptance signature, decapsulates the Kyber ciphertext, derives the same AES-256-GCM key, and stores the session.
+5. All chat/file payloads are encrypted end-to-end with AES-256-GCM and include authenticated associated data for routing metadata.
+
+### Networking model
+
+Quantum Chat uses a WebSocket signaling/relay server to discover online peers and route encrypted envelopes. The relay can see peer public keys and envelope metadata needed for delivery, but not decrypted message text or file contents.
+
+This model works reliably on LANs and across NAT when peers can reach the signaling server. It does not yet implement direct TCP/WebRTC hole punching.
+
+### Persistence
+
+The default SQLite database is `quantum_chat.db`. File bytes are saved in the `files/` directory and metadata is saved in SQLite.
+
+## Command reference
+
+Run the node UI:
+
+```bash
+python chat.py [options]
+```
+
+Useful node options:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--db` | `quantum_chat.db` | SQLite database path. |
+| `--signaling-url` | `ws://127.0.0.1:8766` | Signaling/relay server URL. |
+| `--with-signaling` | disabled | Also start a signaling server in the same process. |
+| `--http-host` | `127.0.0.1` | Host for the browser UI. |
+| `--http-port` | `8000` | Port for the browser UI. |
+| `--ui-ws-host` | `127.0.0.1` | Host for the local UI WebSocket. |
+| `--ui-ws-port` | `8765` | Port for the local UI WebSocket. |
+| `--no-browser` | disabled | Do not open a browser automatically. |
+
+Run only the signaling server:
+
+```bash
+python chat.py signal --host 0.0.0.0 --port 8766
+```
+
+## Project structure
+
+```text
+chat.py             # Application, crypto, DB, WebSocket relay/client, HTTP UI
+requirements.txt   # Runtime dependencies
+README.md          # Documentation
+quantum_chat.db    # Created at runtime
+files/             # Created at runtime for transferred files
+```
+
+## Current limits
+
+- Signaling is server-assisted relay, not pure direct WebRTC/TCP hole punching.
+- The relay can see routing metadata (public keys, online status, envelope type), but not encrypted payload contents.
+- Group messages are pairwise fan-out to current group members rather than TreeKEM or MLS.
+- File transfer currently buffers the whole file in memory and is capped at 25 MB by default.
+- The app is not externally audited and should be reviewed before high-risk deployments.
+
+## Development checks
+
+Compile the app:
+
+```bash
+python -m py_compile chat.py
+```
+
+Exercise the database layer without network services:
+
+```bash
+python - <<'PY'
+from chat import Database
+import tempfile, os
+fd, path = tempfile.mkstemp(); os.close(fd); os.remove(path)
+db = Database(path)
+db.save_identity('abc', b'secret')
+db.add_friend('friend', 'Alice')
+db.create_group('gid', 'Group', 'abc')
+db.add_group_member('gid', 'friend')
+db.save_message('m1', 'abc', 'hello', 'out', recipient='friend', delivered=True)
+print(db.load_identity()[0], db.get_friends()[0]['nickname'], db.groups_for('abc')[0]['name'], db.recent_messages()[0]['body'])
+db.close(); os.remove(path)
+PY
+```
+
+## License
+
+MIT License. See your repository license file if present.
