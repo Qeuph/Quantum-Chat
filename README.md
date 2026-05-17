@@ -11,16 +11,16 @@ Quantum Chat is a single-file, browser-based, post-quantum encrypted peer-to-pee
 - **Post-quantum session setup:** peers authenticate handshakes with ML-DSA/Dilithium signatures and establish shared secrets with Kyber-512.
 - **Session lifecycle:** pairwise sessions track a 24-hour lifetime and the UI warns when session keys are close to expiry.
 - **Modern symmetric encryption:** every chat message and file payload is encrypted with AES-256-GCM using HKDF-derived per-message/session keys.
-- **P2P-style relay:** peers connect to a signaling WebSocket that only routes envelopes; message and file contents remain end-to-end encrypted.
-- **Encrypted files:** files are encrypted in transit, checksum verified on receipt, stored encrypted at rest, shown in a transfer list, previewed where supported by the browser, and downloadable from the local UI.
-- **Groups:** create groups from selected or comma-separated members and send messages or files by encrypting a separate copy for each member's current pairwise session.
+- **Direct peer transport with relay fallback:** nodes advertise an optional direct WebSocket listener and try direct encrypted delivery before falling back to the signaling relay.
+- **Encrypted files:** files are sent as encrypted chunks with a signed manifest, checksum verified on receipt, stored encrypted at rest, shown in a transfer list, previewed where supported by the browser, and downloadable from the local UI.
+- **Groups:** create groups from selected or comma-separated members; messages use a stored group epoch key while membership keys are distributed over authenticated pairwise sessions.
 - **Receipts and reactions:** delivery acknowledgements, read receipts, and emoji reactions are signed, persisted, and reflected in the UI.
 - **Typing and unread state:** typing indicators are ephemeral relay messages, while per-friend unread counts persist in SQLite and clear when a conversation is read.
 - **SQLite persistence:** identity, friends, sessions, groups, messages, files, outbox state, reactions, read receipts, and session health metadata persist across restarts. Secret keys, session keys, message bodies, and local file bytes are encrypted at rest with a per-database local master key file.
-- **Local UI protection:** the browser UI WebSocket requires a random startup token and rejects non-local origins.
-- **Replay hardening:** inbound chat/file payloads include counters and duplicate IDs are ignored before UI broadcast.
-- **Resilient networking:** the node uses exponential backoff when reconnecting to the signaling server and queues eligible outbound relay payloads for retry.
-- **Health and observability:** `/health` exposes local node status as JSON and `--log-level` controls runtime logging verbosity.
+- **Local UI protection:** the browser UI WebSocket requires a random startup token, rejects non-local origins, and remote UI binds require `--allow-remote-ui`.
+- **Replay hardening:** inbound chat/file payloads include counters, a replay window accepts valid out-of-order delivery, and duplicate counters/IDs are rejected.
+- **Resilient networking:** the node uses exponential backoff when reconnecting, queues eligible outbound payloads locally, and the relay persists offline envelopes in a small SQLite queue.
+- **Health and observability:** `/health` exposes node status, queue depth, storage usage, and metrics as JSON, while `--log-level` controls runtime logging verbosity.
 - **One-file app:** all Python, HTTP serving, WebSocket handling, and the browser UI live in `chat.py`.
 
 ## Requirements
@@ -60,7 +60,7 @@ http://127.0.0.1:8000/health
 To run a second local node for testing, use different ports and a different database:
 
 ```bash
-python chat.py --db peer2.db --http-port 8001 --ui-ws-port 8767 --signaling-url ws://127.0.0.1:8766 --no-browser
+python chat.py --db peer2.db --http-port 8001 --ui-ws-port 8767 --direct-port 8769 --signaling-url ws://127.0.0.1:8766 --no-browser
 ```
 
 Then open `http://127.0.0.1:8001` manually.
@@ -73,10 +73,10 @@ Run the signaling server on a reachable host:
 python chat.py signal --host 0.0.0.0 --port 8766
 ```
 
-Run each peer and point it at that signaling server:
+Run each peer and point it at that signaling server. For direct LAN delivery, advertise a host/IP other peers can reach:
 
 ```bash
-python chat.py --signaling-url ws://SIGNALING_HOST_OR_IP:8766
+python chat.py --signaling-url ws://SIGNALING_HOST_OR_IP:8766 --direct-advertise-host THIS_NODE_IP
 ```
 
 Each peer then:
@@ -115,17 +115,17 @@ The local browser interface includes:
 
 ### Networking model
 
-Quantum Chat uses a WebSocket signaling/relay server to discover online peers and route encrypted envelopes. The relay can see peer public keys and envelope metadata needed for delivery, but not decrypted message text or file contents.
+Quantum Chat uses a WebSocket signaling/relay server to discover online peers, exchange direct-transport metadata, and route encrypted envelopes when direct delivery is unavailable. Nodes with reachable direct listeners advertise a direct WebSocket URL and attempt direct friend-to-friend delivery before falling back to the relay. The relay can see enough routing metadata for discovery and fallback delivery, but not decrypted message text or file contents.
 
-The relay issues a signed-registration challenge for clients that support it, validates public-key sizes, performs basic payload-shape checks, and applies per-socket rate limiting. Nodes reconnect with exponential backoff after relay failures.
+The relay issues a signed-registration challenge for clients that support it, validates public-key sizes, records short-lived relay aliases and optional direct URLs, performs basic payload-shape checks, persists bounded offline queues in SQLite, and applies per-socket rate limiting. Nodes reconnect with exponential backoff after relay failures.
 
-This model works reliably on LANs and across NAT when peers can reach the signaling server. It does not yet implement direct TCP/WebRTC hole punching.
+This model works reliably on LANs and across NAT when peers can reach either each other or the signaling server. Direct delivery is opportunistic and relay fallback remains available for peers behind restrictive NAT or firewalls.
 
 ### Persistence
 
 The default SQLite database is `quantum_chat.db`. File metadata is saved in SQLite and encrypted file bytes are saved in the `files/` directory.
 
-A local master key file named like `<database>.key` is created beside the database and protects local secret material, message bodies, session keys, and stored file bytes. Back up both the database and its key file if you need to preserve a node identity and local history.
+A local master key file named like `<database>.key` is created beside the database and protects local secret material, message bodies, session keys, and stored file bytes. For stronger local protection, set `QUANTUM_CHAT_PASSPHRASE` before startup; the app will wrap the local key file with a passphrase-derived wrapping key. Back up both the database and its key material if you need to preserve a node identity and local history.
 
 ## Command reference
 
@@ -149,6 +149,11 @@ Useful node options:
 | `--ui-ws-host` | `127.0.0.1` | Host for the local UI WebSocket. |
 | `--ui-ws-port` | `8765` | Port for the local UI WebSocket. |
 | `--no-browser` | disabled | Do not open a browser automatically. |
+| `--allow-remote-ui` | disabled | Allow non-local HTTP/UI WebSocket binds; non-root HTTP routes require the startup token. |
+| `--enable-direct` / `--no-direct` | enabled | Enable or disable the direct peer WebSocket transport. |
+| `--direct-host` | `127.0.0.1` | Host/interface for the direct peer listener. |
+| `--direct-port` | `8768` | Port for the direct peer listener. |
+| `--direct-advertise-host` | direct host | Host/IP advertised to friends for direct delivery. |
 | `--log-level` | `WARNING` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 
 Run only the signaling server:
@@ -175,13 +180,13 @@ Quantum Chat aims to protect message and file contents from the signaling relay 
 
 Important remaining limits:
 
-- Signaling is server-assisted relay, not pure direct WebRTC/TCP hole punching.
-- The relay can see routing metadata (public keys, online status, envelope type), but not encrypted payload contents.
-- Group messages are pairwise fan-out to current group members rather than TreeKEM or MLS. Group epochs and roles are stored, but membership changes are not yet a full MLS-style group ratchet.
-- Delivery acknowledgements, read receipts, reactions, typing indicators, and queued relay retries improve UX but do not provide a full offline multi-device messaging protocol.
-- File transfer currently buffers the whole file in memory for each recipient and is capped at 25 MB by default.
-- Local at-rest encryption uses a random `*.db.key` file beside the database. Protect and back up this key file; an attacker who steals both the database/files and key file can decrypt local data.
-- The browser UI is intended for local use; if exposed beyond localhost, put it behind TLS and additional access controls.
+- Direct peer WebSocket delivery is attempted when peers advertise reachable direct listeners; the relay remains the fallback for NAT or firewall-restricted peers.
+- Relay-visible metadata is reduced through short-lived aliases and opaque encrypted payloads where possible, but a relay still sees connection timing and enough routing metadata to deliver envelopes.
+- Group messages use stored group epoch keys and signed key distribution; this is stronger than per-message pairwise encryption, though it is not a certified MLS implementation.
+- Delivery acknowledgements, read receipts, reactions, typing indicators, local retries, and relay-persistent offline queues improve UX but do not provide full multi-device synchronization.
+- File transfer uses encrypted chunks and a signed manifest; browsers may still impose practical upload memory limits.
+- Local at-rest encryption can use raw key-file compatibility or passphrase-wrapped key files via `QUANTUM_CHAT_PASSPHRASE`. Protect and back up the active key material.
+- Remote UI exposure is blocked unless `--allow-remote-ui` is provided; production deployments should still put the UI behind TLS and additional access controls.
 - The app is not externally audited and should be reviewed before high-risk deployments.
 
 ## Security and UX hardening in v2.0
@@ -195,7 +200,8 @@ Important remaining limits:
 - Encrypted-at-rest identity keys, session keys, message bodies, and downloaded/sent file bytes.
 - Replay protections using message/file counters plus insert-only duplicate handling.
 - Signed delivery acknowledgements, read receipts, emoji reactions, and group invites.
-- Persistent unread counts, session TTL warnings, exponential relay reconnection, and a JSON health endpoint.
+- Persistent unread counts, enforced session TTL rekeying, direct-delivery metrics, offline relay queueing, and an expanded JSON health endpoint.
+- Safety-number/fingerprint verification state for trusted friends.
 
 ## Packaging and development
 

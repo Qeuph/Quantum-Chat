@@ -27,7 +27,6 @@ import os
 import re
 import secrets
 import sqlite3
-import sys
 import threading
 import time
 import uuid
@@ -51,7 +50,10 @@ SIGNALING_HOST = "0.0.0.0"
 SIGNALING_PORT = 8766
 DEFAULT_SIGNALING_URL = "ws://127.0.0.1:8766"
 MAX_TEXT_BYTES = 64 * 1024
-MAX_FILE_BYTES = 25 * 1024 * 1024
+MAX_FILE_BYTES = 512 * 1024 * 1024
+MAX_CHUNK_BYTES = 512 * 1024
+DIRECT_PEER_HOST = "127.0.0.1"
+DIRECT_PEER_PORT = 8768
 PENDING_OFFER_TTL = 5 * 60
 SESSION_TTL = 24 * 3600           # 24-hour session key lifetime
 SESSION_WARN_SECS = 3600          # warn when < 1 hour left
@@ -65,7 +67,7 @@ MAX_FILENAME_CHARS = 180
 MAX_GROUP_MEMBERS = 128
 MAX_REACTION_EMOJI_BYTES = 8
 ALLOWED_REACTIONS = {"👍", "❤️", "😂", "😮", "😢", "🔥"}
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LOG = logging.getLogger("quantum_chat")
 
 
@@ -263,20 +265,63 @@ class QuantumCrypto:
 # ─── Local Key Store ──────────────────────────────────────────────────────────
 
 class LocalKeyStore:
+    """Load or create the local database encryption key.
+
+    By default the app remains backward compatible with the existing raw
+    ``*.db.key`` file.  Operators can set QUANTUM_CHAT_PASSPHRASE to store a
+    wrapped key instead; the passphrase never becomes the data-encryption key
+    and the file beside the database is not directly usable without it.
+    """
+
     def __init__(self, db_path: str) -> None:
         self.path = Path(f"{db_path}.key")
+        self.mode = os.environ.get("QUANTUM_CHAT_KEY_MODE", "passphrase" if os.environ.get("QUANTUM_CHAT_PASSPHRASE") else "file")
+        self.passphrase = os.environ.get("QUANTUM_CHAT_PASSPHRASE")
+
+    def _wrap_key(self, key: bytes, salt: bytes) -> bytes:
+        AESGCM, HKDF, hashes = require_cryptography()
+        wrapping = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
+                        info=b"quantum-chat-local-key-wrap-v1").derive(self.passphrase.encode("utf-8"))
+        nonce = secrets.token_bytes(12)
+        return nonce + AESGCM(wrapping).encrypt(nonce, key, b"quantum-chat-local-key")
+
+    def _unwrap_key(self, blob: bytes, salt: bytes) -> bytes:
+        AESGCM, HKDF, hashes = require_cryptography()
+        wrapping = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
+                        info=b"quantum-chat-local-key-wrap-v1").derive(self.passphrase.encode("utf-8"))
+        return AESGCM(wrapping).decrypt(blob[:12], blob[12:], b"quantum-chat-local-key")
 
     def load_or_create(self) -> bytes:
         if self.path.exists():
             raw = self.path.read_bytes().strip()
             try:
-                key = b64d(raw.decode("ascii"))
+                text = raw.decode("ascii")
+                if text.startswith("QCWRAP1:"):
+                    if not self.passphrase:
+                        raise RuntimeError("QUANTUM_CHAT_PASSPHRASE is required for this wrapped key file")
+                    _, salt_b64, blob_b64 = text.split(":", 2)
+                    key = self._unwrap_key(b64d(blob_b64), b64d(salt_b64))
+                else:
+                    key = b64d(text)
+                    if self.mode == "passphrase" and self.passphrase:
+                        # One-way compatibility migration: protect the raw key file
+                        # without rewriting any existing database ciphertext.
+                        self._write_wrapped(key)
             except Exception as exc:
                 raise RuntimeError(f"Invalid local key file: {self.path}") from exc
             if len(key) != 32:
                 raise RuntimeError(f"Invalid local key length in {self.path}")
             return key
         key = secrets.token_bytes(32)
+        if self.mode == "passphrase":
+            if not self.passphrase:
+                raise RuntimeError("QUANTUM_CHAT_PASSPHRASE must be set when QUANTUM_CHAT_KEY_MODE=passphrase")
+            self._write_wrapped(key)
+        else:
+            self._write_raw(key)
+        return key
+
+    def _write_raw(self, key: bytes) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(b64e(key), encoding="ascii")
         try:
@@ -284,7 +329,17 @@ class LocalKeyStore:
         except OSError:
             pass
         tmp.replace(self.path)
-        return key
+
+    def _write_wrapped(self, key: bytes) -> None:
+        salt = secrets.token_bytes(16)
+        blob = self._wrap_key(key, salt)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(f"QCWRAP1:{b64e(salt)}:{b64e(blob)}", encoding="ascii")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(self.path)
 
 
 # ─── Database ─────────────────────────────────────────────────────────────────
@@ -317,6 +372,10 @@ class Database:
                     pubkey TEXT PRIMARY KEY,
                     nickname TEXT,
                     trusted INTEGER NOT NULL DEFAULT 1,
+                    verified INTEGER NOT NULL DEFAULT 0,
+                    blocked INTEGER NOT NULL DEFAULT 0,
+                    relay_alias TEXT,
+                    direct_url TEXT,
                     added_at INTEGER NOT NULL,
                     last_seen INTEGER,
                     unread INTEGER NOT NULL DEFAULT 0
@@ -398,12 +457,44 @@ class Database:
                     reader_pubkey TEXT NOT NULL,
                     read_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS recv_counters (
+                    peer_pubkey TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    counter INTEGER NOT NULL,
+                    seen_at INTEGER NOT NULL,
+                    PRIMARY KEY (peer_pubkey, session_id, counter)
+                );
+                CREATE TABLE IF NOT EXISTS group_epochs (
+                    group_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    key BLOB NOT NULL,
+                    key_nonce BLOB,
+                    created_at INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    PRIMARY KEY (group_id, epoch)
+                );
+                CREATE TABLE IF NOT EXISTS file_chunks (
+                    file_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    total_chunks INTEGER NOT NULL,
+                    storage_path TEXT NOT NULL,
+                    received_at INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, chunk_index)
+                );
+                CREATE TABLE IF NOT EXISTS metrics (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE INDEX IF NOT EXISTS idx_messages_target
                     ON messages(sender_pubkey, recipient_pubkey, group_id, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_outbox_target_status
                     ON outbox(target_pubkey, status);
                 CREATE INDEX IF NOT EXISTS idx_reactions_msg
                     ON reactions(msg_id);
+                CREATE INDEX IF NOT EXISTS idx_recv_counters_peer
+                    ON recv_counters(peer_pubkey, session_id, counter);
+                CREATE INDEX IF NOT EXISTS idx_file_chunks_file
+                    ON file_chunks(file_id, chunk_index);
             """)
             self._ensure_columns()
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -423,7 +514,10 @@ class Database:
             "messages": [("status", "TEXT NOT NULL DEFAULT 'sent'"), ("body_nonce", "BLOB"),
                          ("key_version", "INTEGER NOT NULL DEFAULT 0"), ("read_at", "INTEGER")],
             "files": [("file_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0")],
-            "friends": [("unread", "INTEGER NOT NULL DEFAULT 0")],
+            "friends": [("unread", "INTEGER NOT NULL DEFAULT 0"),
+                        ("verified", "INTEGER NOT NULL DEFAULT 0"),
+                        ("blocked", "INTEGER NOT NULL DEFAULT 0"),
+                        ("relay_alias", "TEXT"), ("direct_url", "TEXT")],
         }
         for table, cols in additions.items():
             existing = self._columns(table)
@@ -484,9 +578,9 @@ class Database:
         nickname = validate_label(nickname, "Nickname", MAX_NICKNAME_CHARS) or None
         with self.lock:
             self.conn.execute(
-                "INSERT INTO friends (pubkey, nickname, added_at, unread) VALUES (?, ?, ?, 0) "
+                "INSERT INTO friends (pubkey, nickname, added_at, unread, verified, blocked) VALUES (?, ?, ?, 0, 0, 0) "
                 "ON CONFLICT(pubkey) DO UPDATE SET "
-                "nickname=COALESCE(excluded.nickname, friends.nickname), trusted=1",
+                "nickname=COALESCE(excluded.nickname, friends.nickname), trusted=1, blocked=0",
                 (pubkey, nickname, utc_ts()),
             )
             self.conn.commit()
@@ -499,14 +593,19 @@ class Database:
 
     def get_friends(self) -> List[Dict[str, Any]]:
         with self.lock:
-            return [dict(r) for r in self.conn.execute(
-                "SELECT pubkey, nickname, last_seen, unread FROM friends ORDER BY added_at DESC"
-            )]
+            friends = []
+            for r in self.conn.execute(
+                "SELECT pubkey, nickname, last_seen, unread, verified, blocked, relay_alias, direct_url FROM friends ORDER BY added_at DESC"
+            ):
+                d = dict(r)
+                d["fingerprint"] = key_fingerprint(d["pubkey"])
+                friends.append(d)
+            return friends
 
     def is_friend(self, pubkey: str) -> bool:
         with self.lock:
             return self.conn.execute(
-                "SELECT 1 FROM friends WHERE pubkey=?", (pubkey,)
+                "SELECT 1 FROM friends WHERE pubkey=? AND blocked=0", (pubkey,)
             ).fetchone() is not None
 
     def touch_friend(self, pubkey: str) -> None:
@@ -514,6 +613,25 @@ class Database:
             self.conn.execute(
                 "UPDATE friends SET last_seen=? WHERE pubkey=?", (utc_ts(), pubkey)
             )
+            self.conn.commit()
+
+    def set_friend_transport(self, pubkey: str, relay_alias: Optional[str] = None,
+                             direct_url: Optional[str] = None) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE friends SET relay_alias=COALESCE(?, relay_alias), direct_url=COALESCE(?, direct_url) WHERE pubkey=?",
+                (relay_alias, direct_url, pubkey)
+            )
+            self.conn.commit()
+
+    def verify_friend(self, pubkey: str, verified: bool = True) -> None:
+        with self.lock:
+            self.conn.execute("UPDATE friends SET verified=? WHERE pubkey=?", (int(verified), pubkey))
+            self.conn.commit()
+
+    def block_friend(self, pubkey: str, blocked: bool = True) -> None:
+        with self.lock:
+            self.conn.execute("UPDATE friends SET blocked=? WHERE pubkey=?", (int(blocked), pubkey))
             self.conn.commit()
 
     def increment_unread(self, pubkey: str) -> None:
@@ -591,14 +709,35 @@ class Database:
             return counter
 
     def mark_recv_counter(self, peer_pubkey: str, counter: int) -> None:
+        """Record a received counter with a replay window.
+
+        Older out-of-order messages are accepted if they have not been seen and
+        are within REPLAY_WINDOW of the highest observed counter.
+        """
+        REPLAY_WINDOW = 2048
         with self.lock:
             row = self.conn.execute(
-                "SELECT recv_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
+                "SELECT session_id, recv_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
             ).fetchone()
-            if row and counter <= int(row["recv_counter"]):
-                raise ValueError("Replay or out-of-order message detected")
+            if not row:
+                raise ValueError("No session for replay validation")
+            highest = int(row["recv_counter"])
+            if counter <= max(0, highest - REPLAY_WINDOW):
+                raise ValueError("Message counter is outside the replay window")
+            try:
+                self.conn.execute(
+                    "INSERT INTO recv_counters (peer_pubkey, session_id, counter, seen_at) VALUES (?, ?, ?, ?)",
+                    (peer_pubkey, row["session_id"], counter, utc_ts())
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Replay duplicate message detected") from exc
+            if counter > highest:
+                self.conn.execute(
+                    "UPDATE sessions SET recv_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey)
+                )
             self.conn.execute(
-                "UPDATE sessions SET recv_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey)
+                "DELETE FROM recv_counters WHERE peer_pubkey=? AND session_id=? AND counter<=?",
+                (peer_pubkey, row["session_id"], max(0, max(highest, counter) - REPLAY_WINDOW))
             )
             self.conn.commit()
 
@@ -648,7 +787,35 @@ class Database:
         groups = self.groups_for(pubkey)
         for group in groups:
             group["members"] = self.group_members(group["group_id"])
+            group["fingerprint"] = key_fingerprint(group["group_id"])
         return groups
+
+    def save_group_key(self, group_id: str, epoch: int, key: bytes, created_by: str) -> None:
+        blob, nonce, _ = self.encrypt_blob(key, f"group:{group_id}:{epoch}".encode())
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO group_epochs (group_id, epoch, key, key_nonce, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                (group_id, epoch, blob, nonce, utc_ts(), created_by)
+            )
+            self.conn.execute("UPDATE groups SET epoch=? WHERE group_id=?", (epoch, group_id))
+            self.conn.commit()
+
+    def get_group_key(self, group_id: str, epoch: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            if epoch is None:
+                row = self.conn.execute(
+                    "SELECT ge.* FROM group_epochs ge JOIN groups g ON ge.group_id=g.group_id AND ge.epoch=g.epoch WHERE ge.group_id=?",
+                    (group_id,)
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT * FROM group_epochs WHERE group_id=? AND epoch=?", (group_id, epoch)
+                ).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["key"] = self.decrypt_blob(d["key"], d.get("key_nonce"), f"group:{group_id}:{d['epoch']}".encode())
+            return d
 
     # ── Messages ──────────────────────────────────────────────────────────────
 
@@ -826,6 +993,39 @@ class Database:
             )
             self.conn.commit()
 
+    def save_file_chunk(self, file_id: str, chunk_index: int, total_chunks: int, path: str) -> bool:
+        file_id = validate_file_id(file_id)
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO file_chunks (file_id, chunk_index, total_chunks, storage_path, received_at) VALUES (?, ?, ?, ?, ?)",
+                (file_id, chunk_index, total_chunks, path, utc_ts())
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def file_chunks(self, file_id: str) -> List[Dict[str, Any]]:
+        file_id = validate_file_id(file_id)
+        with self.lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)
+            )]
+
+    def metric_inc(self, name: str, amount: int = 1) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO metrics (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
+                (name, amount)
+            )
+            self.conn.commit()
+
+    def metrics(self) -> Dict[str, int]:
+        with self.lock:
+            return {r["name"]: int(r["value"]) for r in self.conn.execute("SELECT name, value FROM metrics")}
+
+    def outbox_depth(self) -> int:
+        with self.lock:
+            return int(self.conn.execute("SELECT COUNT(*) FROM outbox WHERE status='queued'").fetchone()[0])
+
     def close(self) -> None:
         with self.lock:
             self.conn.close()
@@ -843,7 +1043,8 @@ class PendingOffer:
 
 
 class QuantumNode:
-    def __init__(self, db_path: str = DB_FILE, signaling_url: str = DEFAULT_SIGNALING_URL) -> None:
+    def __init__(self, db_path: str = DB_FILE, signaling_url: str = DEFAULT_SIGNALING_URL,
+                 direct_url: Optional[str] = None, enable_direct: bool = True) -> None:
         self.crypto = QuantumCrypto()
         self.local_master_key = LocalKeyStore(db_path).load_or_create()
         self.db = Database(db_path, master_key=self.local_master_key)
@@ -863,11 +1064,17 @@ class QuantumNode:
         self.group_members: Dict[str, Set[str]] = {}
         self.ui_token = secrets.token_urlsafe(32)
         self.expected_public_key_bytes = self.crypto.sign_public_key_bytes
+        self.relay_alias = hashlib.sha256((self.public_key + ":relay-alias").encode()).hexdigest()
+        self.direct_url = direct_url
+        self.enable_direct = enable_direct
+        self.peer_direct: Dict[str, str] = {}
         self._typing_timers: Dict[str, asyncio.TimerHandle] = {}
         self._load_state()
 
     def _load_state(self) -> None:
         for friend in self.db.get_friends():
+            if friend.get("direct_url"):
+                self.peer_direct[friend["pubkey"]] = friend["direct_url"]
             session = self.db.get_session(friend["pubkey"])
             if session:
                 self.sessions[friend["pubkey"]] = session["key"]
@@ -901,6 +1108,8 @@ class QuantumNode:
             "fingerprint": key_fingerprint(self.public_key),
             "signaling_url": self.signaling_url,
             "online": sorted(self.online_peers),
+            "relay_alias": self.relay_alias,
+            "direct_url": self.direct_url,
             "friends": self.db.get_friends(),
             "groups": self.db.group_details_for(self.public_key),
             "messages": msgs,
@@ -912,12 +1121,52 @@ class QuantumNode:
     async def send_relay(self, peer_pubkey: str, payload: Dict[str, Any],
                          queue_on_failure: bool = False) -> None:
         envelope = {"type": "relay", "to": peer_pubkey, "payload": payload}
+        if self.enable_direct and peer_pubkey in self.peer_direct:
+            try:
+                await self.send_direct(peer_pubkey, payload)
+                self.db.metric_inc("direct_sent")
+                return
+            except Exception as exc:
+                LOG.debug("Direct delivery to %s failed, falling back to relay: %s", short_key(peer_pubkey), exc)
+                self.db.metric_inc("direct_fallback")
         if not self.signaling_ws:
             if queue_on_failure:
                 self.db.queue_outbox(peer_pubkey, envelope)
                 return
             raise RuntimeError("Not connected to signaling server")
         await self.signaling_ws.send(json.dumps(envelope))
+        self.db.metric_inc("relay_sent")
+
+    async def send_direct(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
+        websockets = require_websockets()
+        direct_url = self.peer_direct[peer_pubkey]
+        hello = {"from": self.public_key, "to": peer_pubkey, "sent_at": utc_ts(), "payload": payload}
+        sig = b64e(self.crypto.sign(self.secret_key, canonical_json(hello)))
+        async with websockets.connect(direct_url, max_size=MAX_FILE_BYTES * 2) as ws:
+            await ws.send(json.dumps({"type": "direct", **hello, "signature": sig}))
+            ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            if ack.get("type") != "direct_ack":
+                raise RuntimeError("Direct peer did not acknowledge payload")
+
+    async def handle_direct_peer(self, ws: Any) -> None:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+            msg = json.loads(raw)
+            if msg.get("type") != "direct" or msg.get("to") != self.public_key:
+                raise ValueError("Invalid direct peer frame")
+            peer = self.validate_peer_key(msg.get("from", ""))
+            sig = b64d(msg.get("signature", ""))
+            hello = {"from": peer, "to": self.public_key, "sent_at": msg.get("sent_at"), "payload": msg.get("payload")}
+            if not self.crypto.verify(bytes.fromhex(peer), canonical_json(hello), sig):
+                raise ValueError("Invalid direct peer signature")
+            if not self.db.is_friend(peer):
+                raise ValueError("Direct peer is not a trusted friend")
+            await self.handle_relay_payload(peer, msg.get("payload"))
+            await ws.send(json.dumps({"type": "direct_ack"}))
+            self.db.metric_inc("direct_received")
+        except Exception as exc:
+            self.db.metric_inc("direct_rejected")
+            await ws.send(json.dumps({"type": "error", "text": str(exc)}))
 
     async def flush_outbox(self, peer_pubkey: str) -> None:
         if not self.signaling_ws:
@@ -966,10 +1215,28 @@ class QuantumNode:
             "active_sessions": len(self.sessions),
             "friends": len(self.db.get_friends()),
             "ui_clients": len(self.ui_clients),
+            "direct_enabled": self.enable_direct,
+            "direct_url": self.direct_url,
+            "outbox_depth": self.db.outbox_depth(),
+            "metrics": self.db.metrics(),
+            "file_storage_bytes": sum(p.stat().st_size for p in Path(FILES_DIR).glob("**/*") if p.is_file()) if Path(FILES_DIR).exists() else 0,
             "timestamp": utc_ts(),
         }
 
     # ── Session management ────────────────────────────────────────────────────
+
+    def session_fresh(self, peer_pubkey: str) -> bool:
+        session = self.db.get_session(peer_pubkey)
+        return bool(session and utc_ts() - int(session["established_at"]) < SESSION_TTL)
+
+    async def require_fresh_session(self, peer_pubkey: str, outgoing: bool = True) -> bytes:
+        if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
+            self.sessions.pop(peer_pubkey, None)
+            if outgoing:
+                await self.connect_peer(peer_pubkey)
+                raise ValueError("Secure session expired or missing; rekeying started, retry after handshake completes")
+            raise ValueError("Encrypted payload received for an expired or missing session")
+        return self.sessions[peer_pubkey]
 
     async def connect_peer(self, peer_pubkey: str) -> None:
         self.cleanup_pending_offers()
@@ -1077,9 +1344,7 @@ class QuantumNode:
         text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Message is empty or too large")
-        if peer_pubkey not in self.sessions:
-            await self.connect_peer(peer_pubkey)
-            raise ValueError("Secure session is not ready yet; retry after handshake completes")
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
         msg_id = str(uuid.uuid4())
         counter = self.db.next_send_counter(peer_pubkey)
         payload = {
@@ -1091,7 +1356,7 @@ class QuantumNode:
             "sent_at": utc_ts(),
         }
         msg_key = self.crypto.derive_message_key(
-            self.sessions[peer_pubkey], peer_pubkey, counter, "chat"
+            session_key, peer_pubkey, counter, "chat"
         )
         packet = self.crypto.encrypt(msg_key, text.encode(), canonical_json(payload))
         await self.send_relay(
@@ -1116,14 +1381,13 @@ class QuantumNode:
         })
 
     async def handle_chat(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        if peer_pubkey not in self.sessions:
-            raise ValueError("Encrypted chat received without a session")
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
         payload = data["payload"]
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Chat routing metadata mismatch")
         counter = int(payload.get("counter", 0))
         msg_key = self.crypto.derive_message_key(
-            self.sessions[peer_pubkey], peer_pubkey, counter, "chat"
+            session_key, peer_pubkey, counter, "chat"
         )
         text = self.crypto.decrypt(
             msg_key, data["packet"], canonical_json(payload)
@@ -1157,7 +1421,7 @@ class QuantumNode:
 
     async def send_typing(self, peer_pubkey: str, active: bool) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
-        if peer_pubkey not in self.sessions:
+        if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
             return  # silently skip, session may not exist yet
         try:
             await self.send_relay(peer_pubkey, {
@@ -1192,7 +1456,7 @@ class QuantumNode:
 
     async def send_read_receipt(self, peer_pubkey: str, msg_id: str) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
-        if peer_pubkey not in self.sessions:
+        if peer_pubkey not in self.sessions or not self.session_fresh(peer_pubkey):
             return
         try:
             await self.send_relay(peer_pubkey, self.signed_payload("read_receipt", {
@@ -1226,8 +1490,7 @@ class QuantumNode:
         emoji = validate_emoji(emoji)
         if action not in ("add", "remove"):
             raise ValueError("Reaction action must be 'add' or 'remove'")
-        if peer_pubkey not in self.sessions:
-            raise ValueError("No secure session with this peer")
+        await self.require_fresh_session(peer_pubkey, outgoing=True)
         await self.send_relay(peer_pubkey, self.signed_payload("reaction", {
             "from": self.public_key, "to": peer_pubkey,
             "msg_id": msg_id, "emoji": emoji, "action": action,
@@ -1263,15 +1526,48 @@ class QuantumNode:
             "emoji": emoji, "action": action,
         })
 
+    async def send_group_invite(self, peer_pubkey: str, invite: Dict[str, Any], group_key: bytes) -> None:
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
+        counter = self.db.next_send_counter(peer_pubkey)
+        invite = {**invite, "counter": counter}
+        key_packet = self.crypto.encrypt(
+            self.crypto.derive_message_key(session_key, peer_pubkey, counter, "group-key"),
+            group_key, canonical_json(invite)
+        )
+        await self.send_relay(peer_pubkey, self.signed_payload("group_invite", invite) | {"packet": key_packet}, queue_on_failure=True)
+
     # ── Group messaging ───────────────────────────────────────────────────────
 
     async def send_group_chat(self, group_id: str, text: str) -> None:
         members = set(self.db.group_members(group_id))
         if self.public_key not in members:
             raise ValueError("You are not a member of this group")
+        text = (text or "").strip()
+        if not text or len(text.encode()) > MAX_TEXT_BYTES:
+            raise ValueError("Message is empty or too large")
+        group_key = self.db.get_group_key(group_id)
+        if not group_key:
+            key = secrets.token_bytes(32)
+            self.db.save_group_key(group_id, 1, key, self.public_key)
+            group_key = self.db.get_group_key(group_id)
+        epoch = int(group_key["epoch"])
+        msg_id = str(uuid.uuid4())
+        meta = {"msg_id": msg_id, "from": self.public_key, "group_id": group_id,
+                "epoch": epoch, "sent_at": utc_ts()}
+        packet = self.crypto.encrypt(group_key["key"], text.encode(), canonical_json(meta))
+        envelope = self.signed_payload("group_chat", {"meta": meta, "packet": packet})
+        delivered = 0
         for peer in members - {self.public_key}:
             if self.db.is_friend(peer):
-                await self.send_chat(peer, text, group_id=group_id)
+                await self.send_relay(peer, envelope, queue_on_failure=True)
+                delivered += 1
+        self.db.save_message(msg_id, self.public_key, text, "out", group_id=group_id,
+                             delivered=delivered > 0, status="sent_to_group")
+        await self.broadcast_ui({"type": "message", "message": {
+            "msg_id": msg_id, "sender_pubkey": self.public_key, "recipient_pubkey": None,
+            "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(),
+            "delivered": int(delivered > 0), "status": "sent_to_group", "reactions": [], "read_at": None,
+        }})
 
     async def send_group_file(self, group_id: str, filename: str, encoded: str) -> None:
         members = set(self.db.group_members(group_id))
@@ -1293,9 +1589,7 @@ class QuantumNode:
         raw = b64d(encoded)
         if len(raw) > MAX_FILE_BYTES:
             raise ValueError(f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
-        if peer_pubkey not in self.sessions:
-            await self.connect_peer(peer_pubkey)
-            raise ValueError("Secure session is not ready yet; retry after handshake completes")
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=True)
         file_id = str(uuid.uuid4())
         safe_name = safe_filename(filename)
         sha = hashlib.sha256(raw).hexdigest()
@@ -1306,38 +1600,76 @@ class QuantumNode:
         self.db.save_file(file_id, safe_name, self.public_key, len(raw), sha, storage,
                           recipient=peer_pubkey, group_id=group_id,
                           file_nonce=file_nonce, replace=False)
-        counter = self.db.next_send_counter(peer_pubkey)
-        meta = {
-            "file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha,
-            "from": self.public_key, "to": peer_pubkey,
-            "group_id": group_id, "counter": counter, "sent_at": utc_ts(),
-        }
-        msg_key = self.crypto.derive_message_key(
-            self.sessions[peer_pubkey], peer_pubkey, counter, "file"
-        )
-        packet = self.crypto.encrypt(msg_key, raw, canonical_json(meta))
-        await self.send_relay(
-            peer_pubkey, {"kind": "file", "payload": meta, "packet": packet},
-            queue_on_failure=True
-        )
+        total_chunks = max(1, (len(raw) + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES)
+        manifest = {"file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha,
+                    "from": self.public_key, "to": peer_pubkey, "group_id": group_id,
+                    "total_chunks": total_chunks, "chunk_size": MAX_CHUNK_BYTES, "sent_at": utc_ts()}
+        await self.send_relay(peer_pubkey, self.signed_payload("file_manifest", manifest), queue_on_failure=True)
+        for idx in range(total_chunks):
+            chunk = raw[idx * MAX_CHUNK_BYTES:(idx + 1) * MAX_CHUNK_BYTES]
+            counter = self.db.next_send_counter(peer_pubkey)
+            meta = {**manifest, "chunk_index": idx, "counter": counter,
+                    "chunk_sha256": hashlib.sha256(chunk).hexdigest()}
+            msg_key = self.crypto.derive_message_key(session_key, peer_pubkey, counter, "file-chunk")
+            packet = self.crypto.encrypt(msg_key, chunk, canonical_json(meta))
+            await self.send_relay(peer_pubkey, {"kind": "file_chunk", "payload": meta, "packet": packet}, queue_on_failure=True)
         await self.broadcast_ui({
             "type": "file",
-            "file": {**meta, "direction": "out", "url": f"/files/{file_id}"}
+            "file": {**manifest, "direction": "out", "url": f"/files/{file_id}"}
         })
 
     async def handle_file(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
-        if peer_pubkey not in self.sessions:
-            raise ValueError("Encrypted file received without a session")
+        # Backward-compatible single-packet file receiver.
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
         meta = data["payload"]
         if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
             raise ValueError("File routing metadata mismatch")
         file_id = validate_file_id(meta.get("file_id", ""))
         counter = int(meta.get("counter", 0))
-        msg_key = self.crypto.derive_message_key(
-            self.sessions[peer_pubkey], peer_pubkey, counter, "file"
-        )
+        msg_key = self.crypto.derive_message_key(session_key, peer_pubkey, counter, "file")
         raw = self.crypto.decrypt(msg_key, data["packet"], canonical_json(meta))
         self.db.mark_recv_counter(peer_pubkey, counter)
+        await self._store_complete_file(peer_pubkey, meta, raw, file_id)
+
+    async def handle_file_manifest(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid file manifest signature")
+        meta = data.get("payload", {})
+        if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
+            raise ValueError("File manifest routing mismatch")
+        validate_file_id(meta.get("file_id", ""))
+        if int(meta.get("size", 0)) > MAX_FILE_BYTES:
+            raise ValueError("File exceeds configured limit")
+        self.db.metric_inc("file_manifests_received")
+
+    async def handle_file_chunk(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
+        meta = data["payload"]
+        if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
+            raise ValueError("File chunk routing metadata mismatch")
+        file_id = validate_file_id(meta.get("file_id", ""))
+        counter = int(meta.get("counter", 0))
+        msg_key = self.crypto.derive_message_key(session_key, peer_pubkey, counter, "file-chunk")
+        chunk = self.crypto.decrypt(msg_key, data["packet"], canonical_json(meta))
+        self.db.mark_recv_counter(peer_pubkey, counter)
+        if hashlib.sha256(chunk).hexdigest() != meta.get("chunk_sha256"):
+            raise ValueError("File chunk checksum mismatch")
+        total_chunks = int(meta.get("total_chunks", 1))
+        chunk_index = int(meta.get("chunk_index", 0))
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            raise ValueError("Invalid file chunk index")
+        Path(FILES_DIR).mkdir(exist_ok=True)
+        chunk_dir = Path(FILES_DIR) / f"{file_id}.chunks"
+        chunk_dir.mkdir(exist_ok=True)
+        chunk_path = chunk_dir / str(chunk_index)
+        chunk_path.write_bytes(chunk)
+        self.db.save_file_chunk(file_id, chunk_index, total_chunks, str(chunk_path))
+        chunks = self.db.file_chunks(file_id)
+        if len(chunks) == total_chunks:
+            raw = b"".join(Path(c["storage_path"]).read_bytes() for c in chunks)
+            await self._store_complete_file(peer_pubkey, meta, raw, file_id)
+
+    async def _store_complete_file(self, peer_pubkey: str, meta: Dict[str, Any], raw: bytes, file_id: str) -> None:
         if len(raw) > MAX_FILE_BYTES:
             raise ValueError("File exceeds configured limit")
         if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
@@ -1353,11 +1685,32 @@ class QuantumNode:
         )
         if inserted:
             Path(storage).write_bytes(stored)
-            await self.broadcast_ui({
-                "type": "file",
-                "file": {**meta, "file_id": file_id, "direction": "in",
-                         "url": f"/files/{file_id}"}
-            })
+            await self.broadcast_ui({"type": "file", "file": {**meta, "file_id": file_id, "direction": "in", "url": f"/files/{file_id}"}})
+
+    async def handle_group_chat(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid group message signature")
+        payload = data.get("payload", {})
+        meta = payload.get("meta", {})
+        if meta.get("from") != peer_pubkey:
+            raise ValueError("Group message sender mismatch")
+        group_id = str(meta.get("group_id", ""))
+        if self.public_key not in self.db.group_members(group_id):
+            raise ValueError("Group message for unknown group")
+        group_key = self.db.get_group_key(group_id, int(meta.get("epoch", 0)))
+        if not group_key:
+            raise ValueError("Missing group epoch key")
+        text = self.crypto.decrypt(group_key["key"], payload["packet"], canonical_json(meta)).decode("utf-8")
+        inserted = self.db.save_message(meta["msg_id"], peer_pubkey, text, "in", group_id=group_id,
+                                        delivered=True, status="delivered")
+        if inserted:
+            self.db.increment_unread(peer_pubkey)
+            await self.broadcast_ui({"type": "message", "message": {
+                "msg_id": meta["msg_id"], "sender_pubkey": peer_pubkey,
+                "recipient_pubkey": None, "group_id": group_id, "body": text,
+                "direction": "in", "timestamp": utc_ts(), "delivered": 1,
+                "status": "delivered", "reactions": [], "read_at": None,
+            }})
 
     # ── Relay dispatch ────────────────────────────────────────────────────────
 
@@ -1374,6 +1727,12 @@ class QuantumNode:
             await self.handle_chat(peer_pubkey, payload)
         elif kind == "file":
             await self.handle_file(peer_pubkey, payload)
+        elif kind == "file_manifest":
+            await self.handle_file_manifest(peer_pubkey, payload)
+        elif kind == "file_chunk":
+            await self.handle_file_chunk(peer_pubkey, payload)
+        elif kind == "group_chat":
+            await self.handle_group_chat(peer_pubkey, payload)
         elif kind == "typing":
             await self.handle_typing(peer_pubkey, payload)
         elif kind == "read_receipt":
@@ -1400,13 +1759,18 @@ class QuantumNode:
             if (data.get("from") != peer_pubkey or data.get("to") != self.public_key
                     or self.public_key not in data.get("members", [])):
                 raise ValueError("Group invite metadata mismatch")
-            self.db.create_group(
-                data["group_id"],
-                data.get("name") or f"Group {data['group_id'][:8]}",
-                self.public_key
-            )
+            group_id = validate_file_id(data["group_id"])
+            self.db.create_group(group_id, data.get("name") or f"Group {group_id[:8]}", self.public_key)
             for member in data.get("members", []):
-                self.db.add_group_member(data["group_id"], self.validate_peer_key(member))
+                self.db.add_group_member(group_id, self.validate_peer_key(member))
+            if payload.get("packet"):
+                session_key = await self.require_fresh_session(peer_pubkey, outgoing=False)
+                group_key = self.crypto.decrypt(
+                    self.crypto.derive_message_key(session_key, peer_pubkey, int(data.get("counter", 0)), "group-key"),
+                    payload["packet"], canonical_json(data)
+                )
+                self.db.mark_recv_counter(peer_pubkey, int(data.get("counter", 0)))
+                self.db.save_group_key(group_id, int(data.get("epoch", 1)), group_key, peer_pubkey)
             await self.broadcast_ui(self.state_payload())
 
     # ── UI WebSocket ──────────────────────────────────────────────────────────
@@ -1422,7 +1786,7 @@ class QuantumNode:
             origin = headers.get("Origin")
         if origin:
             host = (urlparse(origin).hostname or "").lower()
-            if host not in {"127.0.0.1", "localhost", "::1"}:
+            if host not in {"127.0.0.1", "localhost", "::1"} and not getattr(self, "allow_remote_ui", False):
                 return False
         return True
 
@@ -1456,6 +1820,12 @@ class QuantumNode:
         elif typ == "remove_friend":
             self.db.remove_friend(self.validate_peer_key(msg["pubkey"]))
             await self.broadcast_ui(self.state_payload())
+        elif typ == "verify_friend":
+            self.db.verify_friend(self.validate_peer_key(msg["pubkey"]), bool(msg.get("verified", True)))
+            await self.broadcast_ui(self.state_payload())
+        elif typ == "block_friend":
+            self.db.block_friend(self.validate_peer_key(msg["pubkey"]), bool(msg.get("blocked", True)))
+            await self.broadcast_ui(self.state_payload())
         elif typ == "connect":
             await self.connect_peer(msg["pubkey"])
         elif typ == "send_message":
@@ -1478,6 +1848,8 @@ class QuantumNode:
             if not isinstance(members_raw, list) or len(members_raw) > MAX_GROUP_MEMBERS:
                 raise ValueError(f"Group members must be a list of at most {MAX_GROUP_MEMBERS}")
             self.db.create_group(group_id, name, self.public_key)
+            group_key = secrets.token_bytes(32)
+            self.db.save_group_key(group_id, 1, group_key, self.public_key)
             for member in members_raw:
                 member = self.validate_peer_key(member)
                 if self.db.is_friend(member):
@@ -1488,10 +1860,7 @@ class QuantumNode:
                             "members": self.db.group_members(group_id),
                             "from": self.public_key, "to": member, "epoch": 1,
                         }
-                        await self.send_relay(
-                            member, self.signed_payload("group_invite", invite),
-                            queue_on_failure=True
-                        )
+                        await self.send_group_invite(member, invite, group_key)
             await self.broadcast_ui(self.state_payload())
         elif typ == "typing":
             await self.send_typing(msg["pubkey"], bool(msg.get("active", True)))
@@ -1537,19 +1906,22 @@ class QuantumNode:
                             await ws.send(json.dumps({
                                 "type": "register", "pubkey": self.public_key,
                                 "signature": sig, "challenge": first["nonce"],
+                                "relay_alias": self.relay_alias, "direct_url": self.direct_url,
                             }))
                         else:
                             await ws.send(json.dumps({
-                                "type": "register", "pubkey": self.public_key
+                                "type": "register", "pubkey": self.public_key,
+                                "relay_alias": self.relay_alias, "direct_url": self.direct_url,
                             }))
                             await self._handle_signaling_message(first)
                     except asyncio.TimeoutError:
                         await ws.send(json.dumps({
-                            "type": "register", "pubkey": self.public_key
+                            "type": "register", "pubkey": self.public_key,
+                            "relay_alias": self.relay_alias, "direct_url": self.direct_url,
                         }))
                     await self.broadcast_ui({
                         "type": "notice", "level": "success",
-                        "text": f"Connected to signaling server"
+                        "text": "Connected to signaling server"
                     })
                     async for raw in ws:
                         try:
@@ -1568,7 +1940,16 @@ class QuantumNode:
 
     async def _handle_signaling_message(self, msg: Dict[str, Any]) -> None:
         if msg.get("type") == "peers":
-            self.online_peers = set(msg.get("peers", [])) - {self.public_key}
+            raw_peers = msg.get("peers", [])
+            if isinstance(raw_peers, dict):
+                self.online_peers = set(raw_peers) - {self.public_key}
+                for peer, meta in raw_peers.items():
+                    if peer != self.public_key and isinstance(meta, dict):
+                        if meta.get("direct_url"):
+                            self.peer_direct[peer] = meta["direct_url"]
+                        self.db.set_friend_transport(peer, meta.get("relay_alias"), meta.get("direct_url"))
+            else:
+                self.online_peers = set(raw_peers) - {self.public_key}
             await self.broadcast_ui(self.state_payload())
             for peer in list(self.online_peers):
                 await self.flush_outbox(peer)
@@ -1586,6 +1967,12 @@ class QuantumNode:
 class SignalingServer:
     def __init__(self) -> None:
         self.clients: Dict[str, Any] = {}
+        self.aliases: Dict[str, str] = {}
+        self.peer_meta: Dict[str, Dict[str, Any]] = {}
+        self.offline: Dict[str, List[Dict[str, Any]]] = {}
+        self.relay_db = sqlite3.connect(os.environ.get("QUANTUM_CHAT_RELAY_DB", "quantum_chat_relay.db"), check_same_thread=False)
+        self.relay_db.execute("CREATE TABLE IF NOT EXISTS offline_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, envelope TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        self.relay_db.commit()
         self.crypto = QuantumCrypto()
         self.rate: Dict[Any, List[int]] = {}
 
@@ -1597,7 +1984,7 @@ class SignalingServer:
         return len(events) <= limit
 
     async def broadcast_peers(self) -> None:
-        payload = json.dumps({"type": "peers", "peers": list(self.clients)})
+        payload = json.dumps({"type": "peers", "peers": self.peer_meta})
         for ws in list(self.clients.values()):
             try:
                 await ws.send(payload)
@@ -1642,10 +2029,23 @@ class SignalingServer:
                             }))
                             continue
                         pubkey = candidate
+                        relay_alias = str(msg.get("relay_alias") or hashlib.sha256(candidate.encode()).hexdigest())
+                        if not HEX_RE.match(relay_alias) or len(relay_alias) > 128:
+                            raise ValueError("Invalid relay alias")
+                        direct_url = msg.get("direct_url") if isinstance(msg.get("direct_url"), str) else None
                         old = self.clients.get(pubkey)
                         if old and old is not ws:
                             await old.close(code=1008, reason="Replaced by signed registration")
                         self.clients[pubkey] = ws
+                        self.aliases[relay_alias] = pubkey
+                        self.peer_meta[pubkey] = {"relay_alias": relay_alias, "direct_url": direct_url}
+                        for queued in self.offline.pop(pubkey, []):
+                            await ws.send(json.dumps(queued))
+                        rows = self.relay_db.execute("SELECT id, envelope FROM offline_queue WHERE target=? ORDER BY id LIMIT 500", (pubkey,)).fetchall()
+                        for qid, envelope in rows:
+                            await ws.send(envelope)
+                            self.relay_db.execute("DELETE FROM offline_queue WHERE id=?", (qid,))
+                        self.relay_db.commit()
                         await self.broadcast_peers()
                     elif msg.get("type") == "relay":
                         if not pubkey:
@@ -1653,9 +2053,13 @@ class SignalingServer:
                                 "type": "error", "text": "Register before relaying"
                             }))
                             continue
-                        target = validate_public_key(
-                            msg.get("to", ""), self.crypto.sign_public_key_bytes
-                        )
+                        raw_target = str(msg.get("to", ""))
+                        try:
+                            target = validate_public_key(raw_target, self.crypto.sign_public_key_bytes)
+                        except ValueError:
+                            target = self.aliases.get(raw_target, "")
+                            if not target:
+                                raise
                         payload = msg.get("payload")
                         if (not isinstance(payload, dict)
                                 or len(json.dumps(payload)) > MAX_FILE_BYTES * 2):
@@ -1668,9 +2072,18 @@ class SignalingServer:
                                 "type": "relay", "from": pubkey, "payload": payload
                             }))
                         else:
-                            await ws.send(json.dumps({
-                                "type": "error", "text": "Peer is offline"
-                            }))
+                            queue = self.offline.setdefault(target, [])
+                            if len(queue) >= 500:
+                                await ws.send(json.dumps({"type": "error", "text": "Peer offline queue is full"}))
+                            else:
+                                queued = {"type": "relay", "from": pubkey, "payload": payload, "offline": True}
+                                queue.append(queued)
+                                self.relay_db.execute(
+                                    "INSERT INTO offline_queue (target, envelope, created_at) VALUES (?, ?, ?)",
+                                    (target, json.dumps(queued), utc_ts())
+                                )
+                                self.relay_db.commit()
+                                await ws.send(json.dumps({"type": "queued", "to": target}))
                 except Exception as exc:
                     LOG.warning("Rejected signaling frame: %s", exc)
                     await ws.send(json.dumps({"type": "error", "text": str(exc)}))
@@ -1678,6 +2091,10 @@ class SignalingServer:
             self.rate.pop(ws, None)
             if pubkey and self.clients.get(pubkey) is ws:
                 del self.clients[pubkey]
+                self.peer_meta.pop(pubkey, None)
+                for alias, owner in list(self.aliases.items()):
+                    if owner == pubkey:
+                        self.aliases.pop(alias, None)
                 await self.broadcast_peers()
 
 
@@ -1690,10 +2107,15 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 class ChatHTTPHandler(BaseHTTPRequestHandler):
     node: QuantumNode = None  # type: ignore
     ui_ws_port: int = UI_WS_PORT
+    require_http_auth: bool = False
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if path != "/" and self.require_http_auth and not self._http_authenticated(parsed):
+            self.send_error(401, "Unauthorized")
+            return
 
         if path == "/":
             body = (
@@ -1737,6 +2159,13 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             return
 
         self.send_error(404)
+
+    def _http_authenticated(self, parsed: Any) -> bool:
+        token = parse_qs(parsed.query).get("token", [""])[0]
+        auth = self.headers.get("Authorization", "")
+        expected = self.node.ui_token if self.node else ""
+        bearer = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        return bool(expected and (secrets.compare_digest(token, expected) or secrets.compare_digest(bearer, expected)))
 
     def _security_headers(self, download: bool = False) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2737,6 +3166,7 @@ body {
 // ─── State ──────────────────────────────────────────────────────────────────
 const UI_WS_PORT = __UI_WS_PORT__;
 const UI_TOKEN = "__UI_TOKEN__";
+const MAX_FILE_BYTES_UI = 512*1024*1024;
 
 let state = {
   public_key: '', fingerprint: '', signaling_url: '',
@@ -2937,11 +3367,11 @@ function renderSidebar() {
         </div>
         <div class="friend-info">
           <div class="friend-name">${esc(f.nickname||short(f.pubkey))}</div>
-          <div class="friend-preview">${lastMsg ? esc(lastMsg.body.slice(0,40)) : secure?'🔒 secure session':'no session'}</div>
+          <div class="friend-preview">${lastMsg ? esc(lastMsg.body.slice(0,40)) : secure?'🔒 secure session':(f.verified?'✅ verified':'⚠️ unverified')}</div>
         </div>
         <div class="friend-meta">
           ${unread ? `<div class="unread-badge">${unread}</div>` : ''}
-          ${secure ? '<div class="secure-tag">🔒</div>' : ''}
+          ${f.verified ? '<div class="secure-tag">✅</div>' : '<div class="secure-tag">⚠️</div>'} ${secure ? '<div class="secure-tag">🔒</div>' : ''}
           ${lastMsg ? `<div class="time-tag">${relTime(lastMsg.timestamp)}</div>` : ''}
         </div>
       `;
@@ -3135,12 +3565,13 @@ function renderChatHeader() {
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
         <div class="chat-header-sub">
-          ${online?'🟢 Online':'⚫ Offline'} · ${secure?'🔒 Secure session':'🔓 No session'}
-          ${f?.last_seen?` · Last seen ${relTime(f.last_seen)}`:''}
+          ${online?'🟢 Online':'⚫ Offline'} · ${secure?'🔒 Secure session':'🔓 No session'} · ${f?.verified?'✅ Verified':'⚠️ Unverified'} · ${f?.direct_url?'🌐 Direct-capable':'relay'}
+          ${f?.fingerprint?` · Safety ${esc(f.fingerprint)}`:''}${f?.last_seen?` · Last seen ${relTime(f.last_seen)}`:''}
         </div>
       </div>
       <div class="chat-header-actions">
         ${!secure?`<button class="btn btn-primary btn-sm" onclick="connectPeer()">Connect</button>`:''}
+        ${f?.verified?`<button class="btn btn-secondary btn-sm" onclick="verifyFriend(false)">Unverify</button>`:`<button class="btn btn-primary btn-sm" onclick="verifyFriend(true)">Verify safety</button>`}
         <button class="btn btn-secondary btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove</button>
       </div>
     `;
@@ -3151,7 +3582,7 @@ function renderChatHeader() {
       <div class="chat-header-avatar">👥</div>
       <div class="chat-header-info">
         <div class="chat-header-name">${esc(name)}</div>
-        <div class="chat-header-sub">${(g?.members||[]).length} members · encrypted fan-out</div>
+        <div class="chat-header-sub">${(g?.members||[]).length} members · group epoch key · ${esc(g?.fingerprint||'')}</div>
       </div>
     `;
   }
@@ -3245,6 +3676,15 @@ function connectPeer() {
   send({type:'connect', pubkey: selectedTarget.id});
 }
 
+function verifyFriend(verified) {
+  if(!selectedTarget || selectedTarget.type !== 'friend') return;
+  const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
+  if(verified && !confirm(`Verify this safety fingerprint?
+
+${f?.fingerprint||selectedTarget.id}`)) return;
+  send({type:'verify_friend', pubkey:selectedTarget.id, verified});
+}
+
 function sendMessage() {
   const text = $('text').value.trim();
   if(!text || !selectedTarget) return;
@@ -3261,7 +3701,7 @@ function sendMessage() {
 function sendFile() {
   const f = $('fileInput').files[0];
   if(!f || !selectedTarget) return;
-  if(f.size > 25*1024*1024) { toast('File exceeds 25 MB limit','error'); return; }
+  if(f.size > MAX_FILE_BYTES_UI) { toast('File exceeds 512 MB limit','error'); return; }
   const r = new FileReader();
   r.onload = () => {
     const data = r.result.split(',')[1];
@@ -3393,7 +3833,7 @@ mainEl.addEventListener('drop', e => {
   if(!selectedTarget) { toast('Select a contact first', 'warning'); return; }
   const file = e.dataTransfer.files[0];
   if(!file) return;
-  if(file.size > 25*1024*1024) { toast('File exceeds 25 MB limit', 'error'); return; }
+  if(file.size > MAX_FILE_BYTES_UI) { toast('File exceeds 512 MB limit', 'error'); return; }
   const r = new FileReader();
   r.onload = () => {
     const data = r.result.split(',')[1];
@@ -3421,9 +3861,10 @@ wsConnect();
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def start_http(node: QuantumNode, host: str, port: int,
-               ui_ws_port: int = UI_WS_PORT) -> ThreadedHTTPServer:
+               ui_ws_port: int = UI_WS_PORT, require_http_auth: bool = False) -> ThreadedHTTPServer:
     ChatHTTPHandler.node = node
     ChatHTTPHandler.ui_ws_port = ui_ws_port
+    ChatHTTPHandler.require_http_auth = require_http_auth
     httpd = ThreadedHTTPServer((host, port), ChatHTTPHandler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -3432,6 +3873,13 @@ def start_http(node: QuantumNode, host: str, port: int,
 async def start_ui_ws(node: QuantumNode, host: str, port: int) -> None:
     websockets = require_websockets()
     async with websockets.serve(node.handle_ui, host, port, max_size=MAX_FILE_BYTES * 2):
+        await asyncio.Future()
+
+
+async def start_direct_peer(node: QuantumNode, host: str, port: int) -> None:
+    websockets = require_websockets()
+    async with websockets.serve(node.handle_direct_peer, host, port, max_size=MAX_FILE_BYTES * 2):
+        LOG.info("Direct peer listener on ws://%s:%d", host, port)
         await asyncio.Future()
 
 
@@ -3444,9 +3892,21 @@ async def start_signaling(host: str, port: int) -> None:
         await asyncio.Future()
 
 
+def _is_local_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 async def run_node(args: argparse.Namespace) -> None:
-    node = QuantumNode(args.db, args.signaling_url)
-    httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port)
+    if (not _is_local_host(args.http_host) or not _is_local_host(args.ui_ws_host)) and not args.allow_remote_ui:
+        raise SystemExit("Refusing to expose the UI on a non-local interface without --allow-remote-ui")
+    direct_url = None
+    if args.enable_direct:
+        advertised_host = args.direct_advertise_host or args.direct_host
+        direct_url = f"ws://{advertised_host}:{args.direct_port}"
+    node = QuantumNode(args.db, args.signaling_url, direct_url=direct_url, enable_direct=args.enable_direct)
+    node.allow_remote_ui = args.allow_remote_ui
+    httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port,
+                       require_http_auth=args.allow_remote_ui)
     LOG.info("%s v%s — identity: %s", APP_NAME, VERSION, node.public_key)
     print(f"{APP_NAME} v{VERSION}")
     print(f"Identity:  {node.public_key}")
@@ -3459,6 +3919,8 @@ async def run_node(args: argparse.Namespace) -> None:
         asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
         asyncio.create_task(node.connect_signaling_loop()),
     ]
+    if args.enable_direct:
+        tasks.append(asyncio.create_task(start_direct_peer(node, args.direct_host, args.direct_port)))
     if args.with_signaling:
         tasks.append(asyncio.create_task(start_signaling(args.signaling_host, args.signaling_port)))
     try:
@@ -3487,6 +3949,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--http-port", type=int, default=HTTP_PORT)
     parser.add_argument("--ui-ws-host", default=UI_WS_HOST)
     parser.add_argument("--ui-ws-port", type=int, default=UI_WS_PORT)
+    parser.add_argument("--allow-remote-ui", action="store_true",
+                        help="allow binding HTTP/UI WebSocket to non-local interfaces and require token auth for non-root HTTP routes")
+    parser.add_argument("--enable-direct", action="store_true", default=True,
+                        help="enable direct peer WebSocket listener and direct delivery fallback")
+    parser.add_argument("--no-direct", dest="enable_direct", action="store_false")
+    parser.add_argument("--direct-host", default=DIRECT_PEER_HOST)
+    parser.add_argument("--direct-port", type=int, default=DIRECT_PEER_PORT)
+    parser.add_argument("--direct-advertise-host", default=None,
+                        help="host/IP peers should use to reach this node's direct listener")
     parser.add_argument("--no-browser", dest="open_browser", action="store_false")
     parser.add_argument(
         "--log-level",
