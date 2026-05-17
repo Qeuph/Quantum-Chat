@@ -4,3 +4,6 @@ quantum_chat.db
 *.db-shm
 *.db-wal
 files/
+*.db
+*.db.key
+*.key.tmp
