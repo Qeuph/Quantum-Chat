@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Quantum Chat: production-oriented post-quantum, end-to-end encrypted P2P chat.
+Quantum Chat v2.0 — production-oriented post-quantum end-to-end encrypted P2P chat.
 
-One-file application with:
-- local browser UI served over HTTP
-- local UI WebSocket API
-- optional built-in signaling/relay WebSocket server
-- post-quantum session setup (ML-DSA/Dilithium signatures + Kyber KEM)
-- AES-256-GCM encrypted messages/files
-- SQLite identity, friends, sessions, groups, and message/file metadata
+New in v2.0:
+- Typing indicators (ephemeral relay)
+- Read receipts (signed, persisted)
+- Emoji reactions (signed, persisted)
+- Per-friend unread message counts
+- Session TTL tracking and expiry warnings
+- Exponential backoff reconnection
+- /health HTTP endpoint
+- Configurable log level (--log-level)
+- Completely redesigned dark UI with image previews, drag-drop, notifications
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -25,18 +29,18 @@ import secrets
 import sqlite3
 import sys
 import threading
-import logging
 import time
 import uuid
 import webbrowser
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import quote, urlparse, parse_qs
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from urllib.parse import quote, urlparse, parse_qs
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 APP_NAME = "Quantum Chat"
+VERSION = "2.0.0"
 DB_FILE = "quantum_chat.db"
 FILES_DIR = "files"
 HTTP_HOST = "127.0.0.1"
@@ -49,22 +53,30 @@ DEFAULT_SIGNALING_URL = "ws://127.0.0.1:8766"
 MAX_TEXT_BYTES = 64 * 1024
 MAX_FILE_BYTES = 25 * 1024 * 1024
 PENDING_OFFER_TTL = 5 * 60
+SESSION_TTL = 24 * 3600           # 24-hour session key lifetime
+SESSION_WARN_SECS = 3600          # warn when < 1 hour left
+TYPING_INACTIVITY_TTL = 6         # clear typing indicator after N seconds silence
+MAX_RECONNECT_DELAY = 60          # cap exponential backoff
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 MAX_NICKNAME_CHARS = 80
 MAX_GROUP_NAME_CHARS = 120
 MAX_FILENAME_CHARS = 180
 MAX_GROUP_MEMBERS = 128
-SCHEMA_VERSION = 2
+MAX_REACTION_EMOJI_BYTES = 8
+ALLOWED_REACTIONS = {"👍", "❤️", "😂", "😮", "😢", "🔥"}
+SCHEMA_VERSION = 3
 LOG = logging.getLogger("quantum_chat")
 
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
 def validate_public_key(pubkey: str, expected_bytes: Optional[int] = None) -> str:
     value = (pubkey or "").strip().lower()
     if not value or len(value) % 2 or not HEX_RE.fullmatch(value):
         raise ValueError("Public key must be a non-empty hexadecimal string")
     if expected_bytes is not None and len(value) != expected_bytes * 2:
-        raise ValueError(f"Public key must be {expected_bytes} bytes ({expected_bytes * 2} hex characters)")
+        raise ValueError(f"Public key must be {expected_bytes} bytes ({expected_bytes * 2} hex chars)")
     return value
 
 
@@ -82,6 +94,13 @@ def validate_label(value: Any, field: str, max_chars: int, required: bool = Fals
     if len(text) > max_chars:
         raise ValueError(f"{field} is too long; maximum is {max_chars} characters")
     return text
+
+
+def validate_emoji(emoji: str) -> str:
+    emoji = (emoji or "").strip()
+    if emoji not in ALLOWED_REACTIONS:
+        raise ValueError(f"Reaction must be one of: {', '.join(sorted(ALLOWED_REACTIONS))}")
+    return emoji
 
 
 def safe_filename(filename: Any) -> str:
@@ -110,12 +129,18 @@ def short_key(pubkey: str) -> str:
     return f"{pubkey[:12]}…{pubkey[-8:]}" if len(pubkey) > 24 else pubkey
 
 
+def key_fingerprint(pubkey: str) -> str:
+    """Return a colon-separated SHA-256 fingerprint (first 8 bytes) of the key."""
+    digest = hashlib.sha256(bytes.fromhex(pubkey)).hexdigest()[:16]
+    return ":".join(digest[i:i+2] for i in range(0, len(digest), 2))
+
+
 def require_websockets():
     try:
         import websockets  # type: ignore
         return websockets
     except ModuleNotFoundError as exc:
-        raise SystemExit("Missing dependency: websockets. Install with `python -m pip install -r requirements.txt`.") from exc
+        raise SystemExit("Missing dependency: websockets. Run `pip install -r requirements.txt`.") from exc
 
 
 def require_cryptography():
@@ -125,11 +150,13 @@ def require_cryptography():
         from cryptography.hazmat.primitives import hashes  # type: ignore
         return AESGCM, HKDF, hashes
     except ModuleNotFoundError as exc:
-        raise SystemExit("Missing dependency: cryptography. Install with `python -m pip install -r requirements.txt`.") from exc
+        raise SystemExit("Missing dependency: cryptography. Run `pip install -r requirements.txt`.") from exc
 
+
+# ─── Post-Quantum Crypto ──────────────────────────────────────────────────────
 
 class PQModule:
-    """Small compatibility wrapper for pqcrypto import/API drift."""
+    """Compatibility wrapper for pqcrypto import/API variance."""
 
     def __init__(self) -> None:
         try:
@@ -138,14 +165,14 @@ class PQModule:
             try:
                 from pqcrypto.dilithium import Dilithium3 as sign_mod  # type: ignore
             except ModuleNotFoundError as exc:
-                raise SystemExit("Missing dependency: pqcrypto. Install with `python -m pip install -r requirements.txt`.") from exc
+                raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         try:
             from pqcrypto.kem import kyber512 as kem_mod  # type: ignore
         except ModuleNotFoundError:
             try:
                 from pqcrypto.kyber import Kyber512 as kem_mod  # type: ignore
             except ModuleNotFoundError as exc:
-                raise SystemExit("Missing dependency: pqcrypto. Install with `python -m pip install -r requirements.txt`.") from exc
+                raise SystemExit("Missing dependency: pqcrypto. Run `pip install -r requirements.txt`.") from exc
         self.sign_mod = sign_mod
         self.kem_mod = kem_mod
         pk, _ = self.sign_keypair()
@@ -210,15 +237,18 @@ class QuantumCrypto:
     def kem_decapsulate(self, secret_key: bytes, ciphertext: bytes) -> bytes:
         return self.pq.decapsulate(secret_key, ciphertext)
 
-    def derive_session_key(self, shared_secret: bytes, a_pub: str, b_pub: str, session_id: str, transcript: Optional[Dict[str, Any]] = None) -> bytes:
+    def derive_session_key(self, shared_secret: bytes, a_pub: str, b_pub: str,
+                           session_id: str, transcript: Optional[Dict[str, Any]] = None) -> bytes:
         transcript_hash = hashlib.sha256(canonical_json(transcript or {})).hexdigest()
         salt = hashlib.sha256("|".join(sorted([a_pub, b_pub]) + [session_id, transcript_hash]).encode()).digest()
-        hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32, salt=salt, info=b"quantum-chat-v4-session-transcript")
+        hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32, salt=salt,
+                         info=b"quantum-chat-v4-session-transcript")
         return hkdf.derive(shared_secret)
 
     def derive_message_key(self, session_key: bytes, peer_pubkey: str, counter: int, purpose: str) -> bytes:
         salt = hashlib.sha256(f"{peer_pubkey}:{counter}:{purpose}".encode()).digest()
-        hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32, salt=salt, info=b"quantum-chat-v1-message-key")
+        hkdf = self.HKDF(algorithm=self.hashes.SHA256(), length=32, salt=salt,
+                         info=b"quantum-chat-v1-message-key")
         return hkdf.derive(session_key)
 
     def encrypt(self, key: bytes, plaintext: bytes, aad: bytes = b"") -> Dict[str, str]:
@@ -230,14 +260,9 @@ class QuantumCrypto:
         return self.AESGCM(key).decrypt(b64d(packet["nonce"]), b64d(packet["ciphertext"]), aad)
 
 
+# ─── Local Key Store ──────────────────────────────────────────────────────────
+
 class LocalKeyStore:
-    """Small local key store used to encrypt data at rest.
-
-    The key is stored beside the database with owner-only permissions. This is
-    not a substitute for an OS keychain or user passphrase, but it prevents
-    casual plaintext disclosure from the SQLite database and files directory.
-    """
-
     def __init__(self, db_path: str) -> None:
         self.path = Path(f"{db_path}.key")
 
@@ -262,6 +287,8 @@ class LocalKeyStore:
         return key
 
 
+# ─── Database ─────────────────────────────────────────────────────────────────
+
 class Database:
     def __init__(self, db_path: str = DB_FILE, master_key: Optional[bytes] = None) -> None:
         self.path = db_path
@@ -277,8 +304,7 @@ class Database:
 
     def _init_tables(self) -> None:
         with self.lock:
-            self.conn.executescript(
-                """
+            self.conn.executescript("""
                 CREATE TABLE IF NOT EXISTS identity (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     public_key TEXT NOT NULL,
@@ -292,7 +318,8 @@ class Database:
                     nickname TEXT,
                     trusted INTEGER NOT NULL DEFAULT 1,
                     added_at INTEGER NOT NULL,
-                    last_seen INTEGER
+                    last_seen INTEGER,
+                    unread INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     peer_pubkey TEXT PRIMARY KEY,
@@ -332,7 +359,8 @@ class Database:
                     delivered INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'sent',
                     body_nonce BLOB,
-                    key_version INTEGER NOT NULL DEFAULT 0
+                    key_version INTEGER NOT NULL DEFAULT 0,
+                    read_at INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS files (
                     file_id TEXT PRIMARY KEY,
@@ -356,10 +384,27 @@ class Database:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_messages_target ON messages(sender_pubkey, recipient_pubkey, group_id, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_outbox_target_status ON outbox(target_pubkey, status);
-                """
-            )
+                CREATE TABLE IF NOT EXISTS reactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    msg_id TEXT NOT NULL,
+                    peer_pubkey TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    direction TEXT NOT NULL DEFAULT 'in',
+                    added_at INTEGER NOT NULL,
+                    UNIQUE(msg_id, peer_pubkey, emoji)
+                );
+                CREATE TABLE IF NOT EXISTS read_receipts (
+                    msg_id TEXT PRIMARY KEY,
+                    reader_pubkey TEXT NOT NULL,
+                    read_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_messages_target
+                    ON messages(sender_pubkey, recipient_pubkey, group_id, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_outbox_target_status
+                    ON outbox(target_pubkey, status);
+                CREATE INDEX IF NOT EXISTS idx_reactions_msg
+                    ON reactions(msg_id);
+            """)
             self._ensure_columns()
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
@@ -368,19 +413,25 @@ class Database:
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
     def _ensure_columns(self) -> None:
-        additions = {
+        additions: Dict[str, List[Tuple[str, str]]] = {
             "identity": [("secret_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0")],
-            "sessions": [("key_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0"), ("send_counter", "INTEGER NOT NULL DEFAULT 0"), ("recv_counter", "INTEGER NOT NULL DEFAULT 0")],
+            "sessions": [("key_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0"),
+                         ("send_counter", "INTEGER NOT NULL DEFAULT 0"),
+                         ("recv_counter", "INTEGER NOT NULL DEFAULT 0")],
             "groups": [("owner_pubkey", "TEXT"), ("epoch", "INTEGER NOT NULL DEFAULT 1")],
             "group_members": [("role", "TEXT NOT NULL DEFAULT 'member'")],
-            "messages": [("status", "TEXT NOT NULL DEFAULT 'sent'"), ("body_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0")],
+            "messages": [("status", "TEXT NOT NULL DEFAULT 'sent'"), ("body_nonce", "BLOB"),
+                         ("key_version", "INTEGER NOT NULL DEFAULT 0"), ("read_at", "INTEGER")],
             "files": [("file_nonce", "BLOB"), ("key_version", "INTEGER NOT NULL DEFAULT 0")],
+            "friends": [("unread", "INTEGER NOT NULL DEFAULT 0")],
         }
         for table, cols in additions.items():
             existing = self._columns(table)
             for name, ddl in cols:
                 if name not in existing:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+    # ── AEAD helpers ──────────────────────────────────────────────────────────
 
     def _aead(self):
         if not self.master_key:
@@ -400,32 +451,42 @@ class Database:
             return ciphertext
         aead = self._aead()
         if not aead:
-            raise RuntimeError("Encrypted database value cannot be decrypted without a master key")
+            raise RuntimeError("Encrypted database value cannot be decrypted without master key")
         return aead.decrypt(nonce, ciphertext, aad)
+
+    # ── Identity ──────────────────────────────────────────────────────────────
 
     def load_identity(self) -> Optional[Tuple[str, bytes]]:
         with self.lock:
-            row = self.conn.execute("SELECT public_key, secret_key, secret_nonce FROM identity WHERE id=1").fetchone()
+            row = self.conn.execute(
+                "SELECT public_key, secret_key, secret_nonce FROM identity WHERE id=1"
+            ).fetchone()
             if not row:
                 return None
-            secret = self.decrypt_blob(row["secret_key"], row["secret_nonce"], f"identity:{row['public_key']}".encode())
+            secret = self.decrypt_blob(row["secret_key"], row["secret_nonce"],
+                                       f"identity:{row['public_key']}".encode())
             return (row["public_key"], secret)
 
     def save_identity(self, public_key: str, secret_key: bytes) -> None:
         blob, nonce, version = self.encrypt_blob(secret_key, f"identity:{public_key}".encode())
         with self.lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO identity (id, public_key, secret_key, created_at, secret_nonce, key_version) VALUES (1, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO identity "
+                "(id, public_key, secret_key, created_at, secret_nonce, key_version) "
+                "VALUES (1, ?, ?, ?, ?, ?)",
                 (public_key, blob, utc_ts(), nonce, version),
             )
             self.conn.commit()
+
+    # ── Friends ───────────────────────────────────────────────────────────────
 
     def add_friend(self, pubkey: str, nickname: Optional[str] = None) -> None:
         nickname = validate_label(nickname, "Nickname", MAX_NICKNAME_CHARS) or None
         with self.lock:
             self.conn.execute(
-                "INSERT INTO friends (pubkey, nickname, added_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(pubkey) DO UPDATE SET nickname=COALESCE(excluded.nickname, friends.nickname), trusted=1",
+                "INSERT INTO friends (pubkey, nickname, added_at, unread) VALUES (?, ?, ?, 0) "
+                "ON CONFLICT(pubkey) DO UPDATE SET "
+                "nickname=COALESCE(excluded.nickname, friends.nickname), trusted=1",
                 (pubkey, nickname, utc_ts()),
             )
             self.conn.commit()
@@ -438,79 +499,150 @@ class Database:
 
     def get_friends(self) -> List[Dict[str, Any]]:
         with self.lock:
-            return [dict(r) for r in self.conn.execute("SELECT pubkey, nickname, last_seen FROM friends ORDER BY added_at DESC")]
+            return [dict(r) for r in self.conn.execute(
+                "SELECT pubkey, nickname, last_seen, unread FROM friends ORDER BY added_at DESC"
+            )]
 
     def is_friend(self, pubkey: str) -> bool:
         with self.lock:
-            return self.conn.execute("SELECT 1 FROM friends WHERE pubkey=?", (pubkey,)).fetchone() is not None
-
-    def session_summary(self) -> Dict[str, Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute("SELECT peer_pubkey, session_id, established_at, initiator, send_counter, recv_counter FROM sessions")
-            return {r["peer_pubkey"]: {"session_id": r["session_id"], "established_at": r["established_at"], "initiator": bool(r["initiator"]), "send_counter": r["send_counter"], "recv_counter": r["recv_counter"]} for r in rows}
+            return self.conn.execute(
+                "SELECT 1 FROM friends WHERE pubkey=?", (pubkey,)
+            ).fetchone() is not None
 
     def touch_friend(self, pubkey: str) -> None:
         with self.lock:
-            self.conn.execute("UPDATE friends SET last_seen=? WHERE pubkey=?", (utc_ts(), pubkey))
+            self.conn.execute(
+                "UPDATE friends SET last_seen=? WHERE pubkey=?", (utc_ts(), pubkey)
+            )
             self.conn.commit()
+
+    def increment_unread(self, pubkey: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE friends SET unread=unread+1 WHERE pubkey=?", (pubkey,)
+            )
+            self.conn.commit()
+
+    def clear_unread(self, pubkey: str) -> None:
+        with self.lock:
+            self.conn.execute("UPDATE friends SET unread=0 WHERE pubkey=?", (pubkey,))
+            self.conn.commit()
+
+    # ── Sessions ──────────────────────────────────────────────────────────────
+
+    def session_summary(self) -> Dict[str, Dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT peer_pubkey, session_id, established_at, initiator, "
+                "send_counter, recv_counter FROM sessions"
+            )
+            return {
+                r["peer_pubkey"]: {
+                    "session_id": r["session_id"],
+                    "established_at": r["established_at"],
+                    "initiator": bool(r["initiator"]),
+                    "send_counter": r["send_counter"],
+                    "recv_counter": r["recv_counter"],
+                    "age_secs": utc_ts() - r["established_at"],
+                    "expires_in": max(0, SESSION_TTL - (utc_ts() - r["established_at"])),
+                }
+                for r in rows
+            }
 
     def save_session(self, peer_pubkey: str, session_id: str, key: bytes, initiator: bool) -> None:
         blob, nonce, version = self.encrypt_blob(key, f"session:{peer_pubkey}:{session_id}".encode())
         with self.lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO sessions (peer_pubkey, session_id, key, established_at, initiator, key_nonce, key_version, send_counter, recv_counter) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT send_counter FROM sessions WHERE peer_pubkey=?),0), COALESCE((SELECT recv_counter FROM sessions WHERE peer_pubkey=?),0))",
-                (peer_pubkey, session_id, blob, utc_ts(), int(initiator), nonce, version, peer_pubkey, peer_pubkey),
+                "INSERT OR REPLACE INTO sessions "
+                "(peer_pubkey, session_id, key, established_at, initiator, key_nonce, key_version, "
+                "send_counter, recv_counter) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, "
+                "COALESCE((SELECT send_counter FROM sessions WHERE peer_pubkey=?),0), "
+                "COALESCE((SELECT recv_counter FROM sessions WHERE peer_pubkey=?),0))",
+                (peer_pubkey, session_id, blob, utc_ts(), int(initiator), nonce, version,
+                 peer_pubkey, peer_pubkey),
             )
             self.conn.commit()
 
     def get_session(self, peer_pubkey: str) -> Optional[Dict[str, Any]]:
         with self.lock:
-            row = self.conn.execute("SELECT * FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
+            ).fetchone()
             if not row:
                 return None
             data = dict(row)
-            data["key"] = self.decrypt_blob(data["key"], data.get("key_nonce"), f"session:{peer_pubkey}:{data['session_id']}".encode())
+            data["key"] = self.decrypt_blob(
+                data["key"], data.get("key_nonce"),
+                f"session:{peer_pubkey}:{data['session_id']}".encode()
+            )
             return data
 
     def next_send_counter(self, peer_pubkey: str) -> int:
         with self.lock:
-            row = self.conn.execute("SELECT send_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)).fetchone()
+            row = self.conn.execute(
+                "SELECT send_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
+            ).fetchone()
             counter = int(row["send_counter"] if row else 0) + 1
-            self.conn.execute("UPDATE sessions SET send_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey))
+            self.conn.execute(
+                "UPDATE sessions SET send_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey)
+            )
             self.conn.commit()
             return counter
 
     def mark_recv_counter(self, peer_pubkey: str, counter: int) -> None:
         with self.lock:
-            row = self.conn.execute("SELECT recv_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)).fetchone()
+            row = self.conn.execute(
+                "SELECT recv_counter FROM sessions WHERE peer_pubkey=?", (peer_pubkey,)
+            ).fetchone()
             if row and counter <= int(row["recv_counter"]):
                 raise ValueError("Replay or out-of-order message detected")
-            self.conn.execute("UPDATE sessions SET recv_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey))
+            self.conn.execute(
+                "UPDATE sessions SET recv_counter=? WHERE peer_pubkey=?", (counter, peer_pubkey)
+            )
             self.conn.commit()
+
+    # ── Groups ────────────────────────────────────────────────────────────────
 
     def create_group(self, group_id: str, name: str, owner_pubkey: str) -> None:
         name = validate_label(name, "Group name", MAX_GROUP_NAME_CHARS, required=True)
         with self.lock:
-            self.conn.execute("INSERT OR IGNORE INTO groups (group_id, name, created_at, owner_pubkey, epoch) VALUES (?, ?, ?, ?, 1)", (group_id, name, utc_ts(), owner_pubkey))
-            self.conn.execute("INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) VALUES (?, ?, ?, ?)", (group_id, owner_pubkey, "owner", utc_ts()))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO groups (group_id, name, created_at, owner_pubkey, epoch) "
+                "VALUES (?, ?, ?, ?, 1)",
+                (group_id, name, utc_ts(), owner_pubkey)
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) "
+                "VALUES (?, ?, ?, ?)",
+                (group_id, owner_pubkey, "owner", utc_ts())
+            )
             self.conn.commit()
 
     def add_group_member(self, group_id: str, pubkey: str, role: str = "member") -> None:
         with self.lock:
-            self.conn.execute("INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) VALUES (?, ?, ?, ?)", (group_id, pubkey, role, utc_ts()))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO group_members (group_id, pubkey, role, joined_at) "
+                "VALUES (?, ?, ?, ?)",
+                (group_id, pubkey, role, utc_ts())
+            )
             self.conn.commit()
 
     def groups_for(self, pubkey: str) -> List[Dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
-                "SELECT g.group_id, g.name, g.created_at, g.owner_pubkey, g.epoch FROM groups g JOIN group_members gm ON g.group_id=gm.group_id WHERE gm.pubkey=? ORDER BY g.created_at DESC",
+                "SELECT g.group_id, g.name, g.created_at, g.owner_pubkey, g.epoch "
+                "FROM groups g JOIN group_members gm ON g.group_id=gm.group_id "
+                "WHERE gm.pubkey=? ORDER BY g.created_at DESC",
                 (pubkey,),
             )
             return [dict(r) for r in rows]
 
     def group_members(self, group_id: str) -> List[str]:
         with self.lock:
-            return [r["pubkey"] for r in self.conn.execute("SELECT pubkey FROM group_members WHERE group_id=?", (group_id,))]
+            return [r["pubkey"] for r in self.conn.execute(
+                "SELECT pubkey FROM group_members WHERE group_id=?", (group_id,)
+            )]
 
     def group_details_for(self, pubkey: str) -> List[Dict[str, Any]]:
         groups = self.groups_for(pubkey)
@@ -518,52 +650,142 @@ class Database:
             group["members"] = self.group_members(group["group_id"])
         return groups
 
-    def save_message(self, msg_id: str, sender: str, body: str, direction: str, recipient: Optional[str] = None, group_id: Optional[str] = None, delivered: bool = False, status: str = "sent") -> bool:
+    # ── Messages ──────────────────────────────────────────────────────────────
+
+    def save_message(self, msg_id: str, sender: str, body: str, direction: str,
+                     recipient: Optional[str] = None, group_id: Optional[str] = None,
+                     delivered: bool = False, status: str = "sent") -> bool:
         plaintext = body.encode("utf-8")
         aad = f"message:{msg_id}:{sender}:{recipient or ''}:{group_id or ''}".encode()
         blob, nonce, version = self.encrypt_blob(plaintext, aad)
         with self.lock:
             cur = self.conn.execute(
-                "INSERT OR IGNORE INTO messages (msg_id, sender_pubkey, recipient_pubkey, group_id, body, direction, timestamp, delivered, status, body_nonce, key_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, sender, recipient, group_id, blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob), direction, utc_ts(), int(delivered), status, nonce, version),
+                "INSERT OR IGNORE INTO messages "
+                "(msg_id, sender_pubkey, recipient_pubkey, group_id, body, direction, "
+                "timestamp, delivered, status, body_nonce, key_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (msg_id, sender, recipient, group_id,
+                 blob.decode("utf-8", "surrogateescape") if not nonce else sqlite3.Binary(blob),
+                 direction, utc_ts(), int(delivered), status, nonce, version),
             )
             self.conn.commit()
             return cur.rowcount > 0
 
     def update_message_status(self, msg_id: str, status: str, delivered: bool = False) -> None:
         with self.lock:
-            self.conn.execute("UPDATE messages SET status=?, delivered=? WHERE msg_id=?", (status, int(delivered), msg_id))
+            self.conn.execute(
+                "UPDATE messages SET status=?, delivered=? WHERE msg_id=?",
+                (status, int(delivered), msg_id)
+            )
+            self.conn.commit()
+
+    def mark_message_read(self, msg_id: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE messages SET read_at=? WHERE msg_id=? AND read_at IS NULL",
+                (utc_ts(), msg_id)
+            )
             self.conn.commit()
 
     def recent_messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,)
+            ).fetchall()
         out: List[Dict[str, Any]] = []
         for r in reversed(rows):
             d = dict(r)
             raw = d["body"]
-            if isinstance(raw, str):
-                raw_b = raw.encode("utf-8", "surrogateescape")
-            else:
-                raw_b = raw
-            aad = f"message:{d['msg_id']}:{d['sender_pubkey']}:{d.get('recipient_pubkey') or ''}:{d.get('group_id') or ''}".encode()
+            raw_b = raw.encode("utf-8", "surrogateescape") if isinstance(raw, str) else raw
+            aad = (f"message:{d['msg_id']}:{d['sender_pubkey']}:"
+                   f"{d.get('recipient_pubkey') or ''}:{d.get('group_id') or ''}").encode()
             d["body"] = self.decrypt_blob(raw_b, d.get("body_nonce"), aad).decode("utf-8")
             out.append(d)
         return out
 
+    # ── Reactions ─────────────────────────────────────────────────────────────
+
+    def add_reaction(self, msg_id: str, peer_pubkey: str, emoji: str,
+                     direction: str = "in") -> bool:
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO reactions (msg_id, peer_pubkey, emoji, direction, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (msg_id, peer_pubkey, emoji, direction, utc_ts())
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def remove_reaction(self, msg_id: str, peer_pubkey: str, emoji: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute(
+                "DELETE FROM reactions WHERE msg_id=? AND peer_pubkey=? AND emoji=?",
+                (msg_id, peer_pubkey, emoji)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def get_reactions(self, msg_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        if not msg_ids:
+            return {}
+        with self.lock:
+            placeholders = ",".join("?" * len(msg_ids))
+            rows = self.conn.execute(
+                f"SELECT msg_id, peer_pubkey, emoji, direction, added_at "
+                f"FROM reactions WHERE msg_id IN ({placeholders})",
+                msg_ids
+            ).fetchall()
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            result.setdefault(r["msg_id"], []).append(dict(r))
+        return result
+
+    # ── Read Receipts ─────────────────────────────────────────────────────────
+
+    def save_read_receipt(self, msg_id: str, reader_pubkey: str) -> bool:
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO read_receipts (msg_id, reader_pubkey, read_at) "
+                "VALUES (?, ?, ?)",
+                (msg_id, reader_pubkey, utc_ts())
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def get_read_receipts(self, msg_ids: List[str]) -> Dict[str, int]:
+        if not msg_ids:
+            return {}
+        with self.lock:
+            placeholders = ",".join("?" * len(msg_ids))
+            rows = self.conn.execute(
+                f"SELECT msg_id, read_at FROM read_receipts WHERE msg_id IN ({placeholders})",
+                msg_ids
+            ).fetchall()
+        return {r["msg_id"]: r["read_at"] for r in rows}
+
+    # ── Files ─────────────────────────────────────────────────────────────────
+
     def recent_files(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,))
+            rows = self.conn.execute(
+                "SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,)
+            )
             return [dict(r) for r in rows]
 
-    def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str, path: str, recipient: Optional[str] = None, group_id: Optional[str] = None, file_nonce: Optional[bytes] = None, replace: bool = False) -> bool:
+    def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str,
+                  path: str, recipient: Optional[str] = None, group_id: Optional[str] = None,
+                  file_nonce: Optional[bytes] = None, replace: bool = False) -> bool:
         file_id = validate_file_id(file_id)
         filename = safe_filename(filename)
         sql = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
         with self.lock:
             cur = self.conn.execute(
-                f"{sql} INTO files (file_id, filename, sender_pubkey, recipient_pubkey, group_id, size, sha256, storage_path, uploaded_at, file_nonce, key_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (file_id, filename, sender, recipient, group_id, size, sha256, path, utc_ts(), file_nonce, 1 if file_nonce else 0),
+                f"{sql} INTO files "
+                "(file_id, filename, sender_pubkey, recipient_pubkey, group_id, "
+                "size, sha256, storage_path, uploaded_at, file_nonce, key_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (file_id, filename, sender, recipient, group_id, size, sha256, path,
+                 utc_ts(), file_nonce, 1 if file_nonce else 0),
             )
             self.conn.commit()
             return cur.rowcount > 0
@@ -571,29 +793,45 @@ class Database:
     def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
         file_id = validate_file_id(file_id)
         with self.lock:
-            row = self.conn.execute("SELECT * FROM files WHERE file_id=?", (file_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM files WHERE file_id=?", (file_id,)
+            ).fetchone()
             return dict(row) if row else None
+
+    # ── Outbox ────────────────────────────────────────────────────────────────
 
     def queue_outbox(self, target_pubkey: str, payload: Dict[str, Any]) -> None:
         now = utc_ts()
         with self.lock:
-            self.conn.execute("INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at) VALUES (?, ?, 'queued', 0, ?, ?)", (target_pubkey, json.dumps(payload), now, now))
+            self.conn.execute(
+                "INSERT INTO outbox (target_pubkey, payload, status, retry_count, created_at, updated_at) "
+                "VALUES (?, ?, 'queued', 0, ?, ?)",
+                (target_pubkey, json.dumps(payload), now, now)
+            )
             self.conn.commit()
 
     def queued_outbox(self, target_pubkey: str, limit: int = 50) -> List[Dict[str, Any]]:
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM outbox WHERE target_pubkey=? AND status='queued' ORDER BY created_at ASC LIMIT ?", (target_pubkey, limit)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM outbox WHERE target_pubkey=? AND status='queued' "
+                "ORDER BY created_at ASC LIMIT ?",
+                (target_pubkey, limit)
+            ).fetchall()
             return [dict(r) for r in rows]
 
     def mark_outbox_sent(self, outbox_id: int) -> None:
         with self.lock:
-            self.conn.execute("UPDATE outbox SET status='sent', updated_at=? WHERE id=?", (utc_ts(), outbox_id))
+            self.conn.execute(
+                "UPDATE outbox SET status='sent', updated_at=? WHERE id=?", (utc_ts(), outbox_id)
+            )
             self.conn.commit()
 
     def close(self) -> None:
         with self.lock:
             self.conn.close()
 
+
+# ─── Node ─────────────────────────────────────────────────────────────────────
 
 @dataclass
 class PendingOffer:
@@ -625,6 +863,7 @@ class QuantumNode:
         self.group_members: Dict[str, Set[str]] = {}
         self.ui_token = secrets.token_urlsafe(32)
         self.expected_public_key_bytes = self.crypto.sign_public_key_bytes
+        self._typing_timers: Dict[str, asyncio.TimerHandle] = {}
         self._load_state()
 
     def _load_state(self) -> None:
@@ -633,7 +872,9 @@ class QuantumNode:
             if session:
                 self.sessions[friend["pubkey"]] = session["key"]
         for group in self.db.groups_for(self.public_key):
-            self.group_members[group["group_id"]] = set(self.db.group_members(group["group_id"]))
+            self.group_members[group["group_id"]] = set(
+                self.db.group_members(group["group_id"])
+            )
 
     async def broadcast_ui(self, event: Dict[str, Any]) -> None:
         payload = json.dumps(event)
@@ -647,19 +888,29 @@ class QuantumNode:
             self.ui_clients.discard(ws)
 
     def state_payload(self) -> Dict[str, Any]:
+        msgs = self.db.recent_messages()
+        msg_ids = [m["msg_id"] for m in msgs]
+        reactions = self.db.get_reactions(msg_ids)
+        read_receipts = self.db.get_read_receipts(msg_ids)
+        for m in msgs:
+            m["reactions"] = reactions.get(m["msg_id"], [])
+            m["read_at"] = read_receipts.get(m["msg_id"])
         return {
             "type": "state",
             "public_key": self.public_key,
+            "fingerprint": key_fingerprint(self.public_key),
             "signaling_url": self.signaling_url,
             "online": sorted(self.online_peers),
             "friends": self.db.get_friends(),
             "groups": self.db.group_details_for(self.public_key),
-            "messages": self.db.recent_messages(),
+            "messages": msgs,
             "files": self.db.recent_files(),
             "sessions": self.db.session_summary(),
+            "version": VERSION,
         }
 
-    async def send_relay(self, peer_pubkey: str, payload: Dict[str, Any], queue_on_failure: bool = False) -> None:
+    async def send_relay(self, peer_pubkey: str, payload: Dict[str, Any],
+                         queue_on_failure: bool = False) -> None:
         envelope = {"type": "relay", "to": peer_pubkey, "payload": payload}
         if not self.signaling_ws:
             if queue_on_failure:
@@ -697,9 +948,28 @@ class QuantumNode:
 
     def cleanup_pending_offers(self) -> None:
         now = utc_ts()
-        expired = [peer for peer, offer in self.pending_offers.items() if now - offer.created_at > PENDING_OFFER_TTL]
+        expired = [
+            peer for peer, offer in self.pending_offers.items()
+            if now - offer.created_at > PENDING_OFFER_TTL
+        ]
         for peer in expired:
             self.pending_offers.pop(peer, None)
+
+    def health(self) -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "version": VERSION,
+            "public_key": self.public_key,
+            "fingerprint": key_fingerprint(self.public_key),
+            "signaling_connected": self.signaling_ws is not None,
+            "online_peers": len(self.online_peers),
+            "active_sessions": len(self.sessions),
+            "friends": len(self.db.get_friends()),
+            "ui_clients": len(self.ui_clients),
+            "timestamp": utc_ts(),
+        }
+
+    # ── Session management ────────────────────────────────────────────────────
 
     async def connect_peer(self, peer_pubkey: str) -> None:
         self.cleanup_pending_offers()
@@ -710,14 +980,29 @@ class QuantumNode:
             raise ValueError("Add this public key as a friend before connecting")
         kem_pk, kem_sk = self.crypto.new_kem_keypair()
         session_id = str(uuid.uuid4())
-        payload = {"protocol": "quantum-chat-v4", "from": self.public_key, "to": peer_pubkey, "session_id": session_id, "kem_pk": b64e(kem_pk), "created_at": utc_ts()}
-        self.pending_offers[peer_pubkey] = PendingOffer(peer_pubkey, session_id, kem_sk, utc_ts(), payload)
+        payload = {
+            "protocol": "quantum-chat-v4",
+            "from": self.public_key,
+            "to": peer_pubkey,
+            "session_id": session_id,
+            "kem_pk": b64e(kem_pk),
+            "created_at": utc_ts(),
+        }
+        self.pending_offers[peer_pubkey] = PendingOffer(
+            peer_pubkey, session_id, kem_sk, utc_ts(), payload
+        )
         await self.send_relay(peer_pubkey, self.signed_payload("session_offer", payload))
-        await self.broadcast_ui({"type": "notice", "level": "info", "text": f"Session offer sent to {short_key(peer_pubkey)}"})
+        await self.broadcast_ui({
+            "type": "notice", "level": "info",
+            "text": f"Session offer sent to {short_key(peer_pubkey)}"
+        })
 
     async def handle_session_offer(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if not self.db.is_friend(peer_pubkey):
-            await self.broadcast_ui({"type": "notice", "level": "warning", "text": f"Rejected untrusted session offer from {short_key(peer_pubkey)}"})
+            await self.broadcast_ui({
+                "type": "notice", "level": "warning",
+                "text": f"Rejected untrusted session offer from {short_key(peer_pubkey)}"
+            })
             return
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid session offer signature")
@@ -729,14 +1014,30 @@ class QuantumNode:
         if payload.get("protocol") != "quantum-chat-v4":
             raise ValueError("Unsupported session protocol")
         ciphertext, secret = self.crypto.kem_encapsulate(b64d(payload["kem_pk"]))
-        transcript = {"offer": payload, "ciphertext": b64e(ciphertext), "roles": {"initiator": peer_pubkey, "responder": self.public_key}}
-        key = self.crypto.derive_session_key(secret, self.public_key, peer_pubkey, payload["session_id"], transcript)
+        transcript = {
+            "offer": payload,
+            "ciphertext": b64e(ciphertext),
+            "roles": {"initiator": peer_pubkey, "responder": self.public_key},
+        }
+        key = self.crypto.derive_session_key(
+            secret, self.public_key, peer_pubkey, payload["session_id"], transcript
+        )
         self.sessions[peer_pubkey] = key
         self.db.save_session(peer_pubkey, payload["session_id"], key, initiator=False)
         self.db.touch_friend(peer_pubkey)
-        accept = {"protocol": "quantum-chat-v4", "from": self.public_key, "to": peer_pubkey, "session_id": payload["session_id"], "ciphertext": b64e(ciphertext), "accepted_at": utc_ts()}
+        accept = {
+            "protocol": "quantum-chat-v4",
+            "from": self.public_key,
+            "to": peer_pubkey,
+            "session_id": payload["session_id"],
+            "ciphertext": b64e(ciphertext),
+            "accepted_at": utc_ts(),
+        }
         await self.send_relay(peer_pubkey, self.signed_payload("session_accept", accept))
-        await self.broadcast_ui({"type": "notice", "level": "success", "text": f"Secure session established with {short_key(peer_pubkey)}"})
+        await self.broadcast_ui({
+            "type": "notice", "level": "success",
+            "text": f"Secure session established with {short_key(peer_pubkey)}"
+        })
         await self.broadcast_ui(self.state_payload())
 
     async def handle_session_accept(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
@@ -751,15 +1052,27 @@ class QuantumNode:
         if payload.get("protocol") != "quantum-chat-v4":
             raise ValueError("Unsupported session protocol")
         secret = self.crypto.kem_decapsulate(pending.kem_secret_key, b64d(payload["ciphertext"]))
-        transcript = {"offer": pending.offer_payload, "ciphertext": payload["ciphertext"], "roles": {"initiator": self.public_key, "responder": peer_pubkey}}
-        key = self.crypto.derive_session_key(secret, self.public_key, peer_pubkey, payload["session_id"], transcript)
+        transcript = {
+            "offer": pending.offer_payload,
+            "ciphertext": payload["ciphertext"],
+            "roles": {"initiator": self.public_key, "responder": peer_pubkey},
+        }
+        key = self.crypto.derive_session_key(
+            secret, self.public_key, peer_pubkey, payload["session_id"], transcript
+        )
         self.sessions[peer_pubkey] = key
         self.db.save_session(peer_pubkey, payload["session_id"], key, initiator=True)
         self.db.touch_friend(peer_pubkey)
-        await self.broadcast_ui({"type": "notice", "level": "success", "text": f"Secure session established with {short_key(peer_pubkey)}"})
+        await self.broadcast_ui({
+            "type": "notice", "level": "success",
+            "text": f"Secure session established with {short_key(peer_pubkey)}"
+        })
         await self.broadcast_ui(self.state_payload())
 
-    async def send_chat(self, peer_pubkey: str, text: str, group_id: Optional[str] = None) -> None:
+    # ── Chat ──────────────────────────────────────────────────────────────────
+
+    async def send_chat(self, peer_pubkey: str, text: str,
+                        group_id: Optional[str] = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
@@ -769,12 +1082,38 @@ class QuantumNode:
             raise ValueError("Secure session is not ready yet; retry after handshake completes")
         msg_id = str(uuid.uuid4())
         counter = self.db.next_send_counter(peer_pubkey)
-        payload = {"msg_id": msg_id, "from": self.public_key, "to": peer_pubkey, "group_id": group_id, "counter": counter, "sent_at": utc_ts()}
-        msg_key = self.crypto.derive_message_key(self.sessions[peer_pubkey], peer_pubkey, counter, "chat")
+        payload = {
+            "msg_id": msg_id,
+            "from": self.public_key,
+            "to": peer_pubkey,
+            "group_id": group_id,
+            "counter": counter,
+            "sent_at": utc_ts(),
+        }
+        msg_key = self.crypto.derive_message_key(
+            self.sessions[peer_pubkey], peer_pubkey, counter, "chat"
+        )
         packet = self.crypto.encrypt(msg_key, text.encode(), canonical_json(payload))
-        await self.send_relay(peer_pubkey, {"kind": "chat", "payload": payload, "packet": packet}, queue_on_failure=True)
-        self.db.save_message(msg_id, self.public_key, text, "out", recipient=peer_pubkey, group_id=group_id, delivered=False, status="sent_to_relay")
-        await self.broadcast_ui({"type": "message", "message": {"msg_id": msg_id, "sender_pubkey": self.public_key, "recipient_pubkey": peer_pubkey, "group_id": group_id, "body": text, "direction": "out", "timestamp": utc_ts(), "delivered": 0, "status": "sent_to_relay"}})
+        await self.send_relay(
+            peer_pubkey,
+            {"kind": "chat", "payload": payload, "packet": packet},
+            queue_on_failure=True
+        )
+        self.db.save_message(
+            msg_id, self.public_key, text, "out",
+            recipient=peer_pubkey, group_id=group_id,
+            delivered=False, status="sent_to_relay"
+        )
+        await self.broadcast_ui({
+            "type": "message",
+            "message": {
+                "msg_id": msg_id, "sender_pubkey": self.public_key,
+                "recipient_pubkey": peer_pubkey, "group_id": group_id,
+                "body": text, "direction": "out",
+                "timestamp": utc_ts(), "delivered": 0,
+                "status": "sent_to_relay", "reactions": [], "read_at": None,
+            }
+        })
 
     async def handle_chat(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if peer_pubkey not in self.sessions:
@@ -783,13 +1122,148 @@ class QuantumNode:
         if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
             raise ValueError("Chat routing metadata mismatch")
         counter = int(payload.get("counter", 0))
-        msg_key = self.crypto.derive_message_key(self.sessions[peer_pubkey], peer_pubkey, counter, "chat")
-        text = self.crypto.decrypt(msg_key, data["packet"], canonical_json(payload)).decode("utf-8")
+        msg_key = self.crypto.derive_message_key(
+            self.sessions[peer_pubkey], peer_pubkey, counter, "chat"
+        )
+        text = self.crypto.decrypt(
+            msg_key, data["packet"], canonical_json(payload)
+        ).decode("utf-8")
         self.db.mark_recv_counter(peer_pubkey, counter)
-        inserted = self.db.save_message(payload["msg_id"], peer_pubkey, text, "in", recipient=self.public_key, group_id=payload.get("group_id"), delivered=True, status="delivered")
+        inserted = self.db.save_message(
+            payload["msg_id"], peer_pubkey, text, "in",
+            recipient=self.public_key, group_id=payload.get("group_id"),
+            delivered=True, status="delivered"
+        )
         if inserted:
-            await self.send_relay(peer_pubkey, self.signed_payload("delivery_ack", {"from": self.public_key, "to": peer_pubkey, "msg_id": payload["msg_id"], "delivered_at": utc_ts()}), queue_on_failure=True)
-            await self.broadcast_ui({"type": "message", "message": {"msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey, "recipient_pubkey": self.public_key, "group_id": payload.get("group_id"), "body": text, "direction": "in", "timestamp": utc_ts(), "delivered": 1, "status": "delivered"}})
+            self.db.increment_unread(peer_pubkey)
+            ack = self.signed_payload("delivery_ack", {
+                "from": self.public_key, "to": peer_pubkey,
+                "msg_id": payload["msg_id"], "delivered_at": utc_ts(),
+            })
+            await self.send_relay(peer_pubkey, ack, queue_on_failure=True)
+            await self.broadcast_ui({
+                "type": "message",
+                "message": {
+                    "msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey,
+                    "recipient_pubkey": self.public_key,
+                    "group_id": payload.get("group_id"),
+                    "body": text, "direction": "in",
+                    "timestamp": utc_ts(), "delivered": 1,
+                    "status": "delivered", "reactions": [], "read_at": None,
+                }
+            })
+
+    # ── Typing Indicators ─────────────────────────────────────────────────────
+
+    async def send_typing(self, peer_pubkey: str, active: bool) -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        if peer_pubkey not in self.sessions:
+            return  # silently skip, session may not exist yet
+        try:
+            await self.send_relay(peer_pubkey, {
+                "kind": "typing",
+                "from": self.public_key,
+                "to": peer_pubkey,
+                "active": active,
+            })
+        except Exception:
+            pass  # typing indicators are ephemeral — failures are acceptable
+
+    async def handle_typing(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
+            return
+        active = bool(data.get("active"))
+        # Cancel any pending clear timer
+        if peer_pubkey in self._typing_timers:
+            self._typing_timers[peer_pubkey].cancel()
+            del self._typing_timers[peer_pubkey]
+        await self.broadcast_ui({"type": "typing", "peer": peer_pubkey, "active": active})
+        if active:
+            loop = asyncio.get_event_loop()
+            handle = loop.call_later(
+                TYPING_INACTIVITY_TTL,
+                lambda: asyncio.ensure_future(
+                    self.broadcast_ui({"type": "typing", "peer": peer_pubkey, "active": False})
+                )
+            )
+            self._typing_timers[peer_pubkey] = handle
+
+    # ── Read Receipts ─────────────────────────────────────────────────────────
+
+    async def send_read_receipt(self, peer_pubkey: str, msg_id: str) -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        if peer_pubkey not in self.sessions:
+            return
+        try:
+            await self.send_relay(peer_pubkey, self.signed_payload("read_receipt", {
+                "from": self.public_key, "to": peer_pubkey,
+                "msg_id": msg_id, "read_at": utc_ts(),
+            }), queue_on_failure=True)
+        except Exception as exc:
+            LOG.debug("Failed to send read receipt: %s", exc)
+
+    async def handle_read_receipt(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid read receipt signature")
+        payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Read receipt routing mismatch")
+        msg_id = str(payload.get("msg_id", ""))
+        if self.db.save_read_receipt(msg_id, peer_pubkey):
+            self.db.update_message_status(msg_id, "read", delivered=True)
+            await self.broadcast_ui({
+                "type": "read_receipt",
+                "msg_id": msg_id,
+                "peer": peer_pubkey,
+                "read_at": payload.get("read_at", utc_ts()),
+            })
+
+    # ── Reactions ─────────────────────────────────────────────────────────────
+
+    async def send_reaction(self, peer_pubkey: str, msg_id: str,
+                            emoji: str, action: str = "add") -> None:
+        peer_pubkey = self.validate_peer_key(peer_pubkey)
+        emoji = validate_emoji(emoji)
+        if action not in ("add", "remove"):
+            raise ValueError("Reaction action must be 'add' or 'remove'")
+        if peer_pubkey not in self.sessions:
+            raise ValueError("No secure session with this peer")
+        await self.send_relay(peer_pubkey, self.signed_payload("reaction", {
+            "from": self.public_key, "to": peer_pubkey,
+            "msg_id": msg_id, "emoji": emoji, "action": action,
+        }), queue_on_failure=True)
+        if action == "add":
+            self.db.add_reaction(msg_id, self.public_key, emoji, direction="out")
+        else:
+            self.db.remove_reaction(msg_id, self.public_key, emoji)
+        await self.broadcast_ui({
+            "type": "reaction",
+            "msg_id": msg_id, "peer": self.public_key,
+            "emoji": emoji, "action": action,
+        })
+
+    async def handle_reaction(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
+        if not self.verify_signed(peer_pubkey, data):
+            raise ValueError("Invalid reaction signature")
+        payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Reaction routing mismatch")
+        emoji = validate_emoji(payload.get("emoji", ""))
+        action = payload.get("action", "add")
+        if action not in ("add", "remove"):
+            raise ValueError("Invalid reaction action")
+        msg_id = str(payload.get("msg_id", ""))
+        if action == "add":
+            self.db.add_reaction(msg_id, peer_pubkey, emoji, direction="in")
+        else:
+            self.db.remove_reaction(msg_id, peer_pubkey, emoji)
+        await self.broadcast_ui({
+            "type": "reaction",
+            "msg_id": msg_id, "peer": peer_pubkey,
+            "emoji": emoji, "action": action,
+        })
+
+    # ── Group messaging ───────────────────────────────────────────────────────
 
     async def send_group_chat(self, group_id: str, text: str) -> None:
         members = set(self.db.group_members(group_id))
@@ -809,13 +1283,16 @@ class QuantumNode:
                 await self.send_file(peer, filename, encoded, group_id=group_id)
                 sent += 1
         if not sent:
-            raise ValueError("No group members with active friend records were available for file delivery")
+            raise ValueError("No group members with active friend records available")
 
-    async def send_file(self, peer_pubkey: str, filename: str, encoded: str, group_id: Optional[str] = None) -> None:
+    # ── File transfer ─────────────────────────────────────────────────────────
+
+    async def send_file(self, peer_pubkey: str, filename: str, encoded: str,
+                        group_id: Optional[str] = None) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
         raw = b64d(encoded)
         if len(raw) > MAX_FILE_BYTES:
-            raise ValueError(f"File exceeds {MAX_FILE_BYTES // (1024 * 1024)} MB limit")
+            raise ValueError(f"File exceeds {MAX_FILE_BYTES // (1024*1024)} MB limit")
         if peer_pubkey not in self.sessions:
             await self.connect_peer(peer_pubkey)
             raise ValueError("Secure session is not ready yet; retry after handshake completes")
@@ -826,13 +1303,27 @@ class QuantumNode:
         storage = str(Path(FILES_DIR) / file_id)
         stored, file_nonce = self.encrypt_for_disk(raw, file_id)
         Path(storage).write_bytes(stored)
-        self.db.save_file(file_id, safe_name, self.public_key, len(raw), sha, storage, recipient=peer_pubkey, group_id=group_id, file_nonce=file_nonce, replace=False)
+        self.db.save_file(file_id, safe_name, self.public_key, len(raw), sha, storage,
+                          recipient=peer_pubkey, group_id=group_id,
+                          file_nonce=file_nonce, replace=False)
         counter = self.db.next_send_counter(peer_pubkey)
-        meta = {"file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha, "from": self.public_key, "to": peer_pubkey, "group_id": group_id, "counter": counter, "sent_at": utc_ts()}
-        msg_key = self.crypto.derive_message_key(self.sessions[peer_pubkey], peer_pubkey, counter, "file")
+        meta = {
+            "file_id": file_id, "filename": safe_name, "size": len(raw), "sha256": sha,
+            "from": self.public_key, "to": peer_pubkey,
+            "group_id": group_id, "counter": counter, "sent_at": utc_ts(),
+        }
+        msg_key = self.crypto.derive_message_key(
+            self.sessions[peer_pubkey], peer_pubkey, counter, "file"
+        )
         packet = self.crypto.encrypt(msg_key, raw, canonical_json(meta))
-        await self.send_relay(peer_pubkey, {"kind": "file", "payload": meta, "packet": packet}, queue_on_failure=True)
-        await self.broadcast_ui({"type": "file", "file": {**meta, "direction": "out", "url": f"/files/{file_id}"}})
+        await self.send_relay(
+            peer_pubkey, {"kind": "file", "payload": meta, "packet": packet},
+            queue_on_failure=True
+        )
+        await self.broadcast_ui({
+            "type": "file",
+            "file": {**meta, "direction": "out", "url": f"/files/{file_id}"}
+        })
 
     async def handle_file(self, peer_pubkey: str, data: Dict[str, Any]) -> None:
         if peer_pubkey not in self.sessions:
@@ -842,7 +1333,9 @@ class QuantumNode:
             raise ValueError("File routing metadata mismatch")
         file_id = validate_file_id(meta.get("file_id", ""))
         counter = int(meta.get("counter", 0))
-        msg_key = self.crypto.derive_message_key(self.sessions[peer_pubkey], peer_pubkey, counter, "file")
+        msg_key = self.crypto.derive_message_key(
+            self.sessions[peer_pubkey], peer_pubkey, counter, "file"
+        )
         raw = self.crypto.decrypt(msg_key, data["packet"], canonical_json(meta))
         self.db.mark_recv_counter(peer_pubkey, counter)
         if len(raw) > MAX_FILE_BYTES:
@@ -852,10 +1345,21 @@ class QuantumNode:
         Path(FILES_DIR).mkdir(exist_ok=True)
         storage = str(Path(FILES_DIR) / file_id)
         stored, file_nonce = self.encrypt_for_disk(raw, file_id)
-        inserted = self.db.save_file(file_id, safe_filename(meta.get("filename") or "download.bin"), peer_pubkey, len(raw), meta["sha256"], storage, recipient=self.public_key, group_id=meta.get("group_id"), file_nonce=file_nonce, replace=False)
+        inserted = self.db.save_file(
+            file_id, safe_filename(meta.get("filename") or "download.bin"),
+            peer_pubkey, len(raw), meta["sha256"], storage,
+            recipient=self.public_key, group_id=meta.get("group_id"),
+            file_nonce=file_nonce, replace=False
+        )
         if inserted:
             Path(storage).write_bytes(stored)
-            await self.broadcast_ui({"type": "file", "file": {**meta, "file_id": file_id, "direction": "in", "url": f"/files/{file_id}"}})
+            await self.broadcast_ui({
+                "type": "file",
+                "file": {**meta, "file_id": file_id, "direction": "in",
+                         "url": f"/files/{file_id}"}
+            })
+
+    # ── Relay dispatch ────────────────────────────────────────────────────────
 
     async def handle_relay_payload(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
         peer_pubkey = self.validate_peer_key(peer_pubkey)
@@ -870,24 +1374,42 @@ class QuantumNode:
             await self.handle_chat(peer_pubkey, payload)
         elif kind == "file":
             await self.handle_file(peer_pubkey, payload)
+        elif kind == "typing":
+            await self.handle_typing(peer_pubkey, payload)
+        elif kind == "read_receipt":
+            await self.handle_read_receipt(peer_pubkey, payload)
+        elif kind == "reaction":
+            await self.handle_reaction(peer_pubkey, payload)
         elif kind == "delivery_ack":
             if not self.verify_signed(peer_pubkey, payload):
                 raise ValueError("Invalid delivery acknowledgement")
             data = payload.get("payload", {})
             if data.get("from") != peer_pubkey or data.get("to") != self.public_key:
-                raise ValueError("Delivery acknowledgement routing mismatch")
-            self.db.update_message_status(str(data.get("msg_id", "")), "delivered_to_peer", delivered=True)
-            await self.broadcast_ui(self.state_payload())
+                raise ValueError("Delivery ack routing mismatch")
+            self.db.update_message_status(str(data.get("msg_id", "")),
+                                          "delivered_to_peer", delivered=True)
+            await self.broadcast_ui({
+                "type": "status_update",
+                "msg_id": str(data.get("msg_id", "")),
+                "status": "delivered_to_peer",
+            })
         elif kind == "group_invite":
             if not self.db.is_friend(peer_pubkey) or not self.verify_signed(peer_pubkey, payload):
                 raise ValueError("Invalid group invite")
             data = payload.get("payload", {})
-            if data.get("from") != peer_pubkey or data.get("to") != self.public_key or self.public_key not in data.get("members", []):
+            if (data.get("from") != peer_pubkey or data.get("to") != self.public_key
+                    or self.public_key not in data.get("members", [])):
                 raise ValueError("Group invite metadata mismatch")
-            self.db.create_group(data["group_id"], data.get("name") or f"Group {data['group_id'][:8]}", self.public_key)
+            self.db.create_group(
+                data["group_id"],
+                data.get("name") or f"Group {data['group_id'][:8]}",
+                self.public_key
+            )
             for member in data.get("members", []):
                 self.db.add_group_member(data["group_id"], self.validate_peer_key(member))
             await self.broadcast_ui(self.state_payload())
+
+    # ── UI WebSocket ──────────────────────────────────────────────────────────
 
     def _ui_authenticated(self, ws: Any) -> bool:
         path = getattr(ws, "path", "/") or "/"
@@ -914,85 +1436,135 @@ class QuantumNode:
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
-                    typ = msg.get("type")
-                    if typ == "add_friend":
-                        pubkey = self.validate_peer_key(msg["pubkey"])
-                        if pubkey == self.public_key:
-                            raise ValueError("You cannot add your own public key as a friend")
-                        self.db.add_friend(pubkey, msg.get("nickname"))
-                        await self.broadcast_ui(self.state_payload())
-                    elif typ == "remove_friend":
-                        self.db.remove_friend(self.validate_peer_key(msg["pubkey"]))
-                        await self.broadcast_ui(self.state_payload())
-                    elif typ == "connect":
-                        await self.connect_peer(msg["pubkey"])
-                    elif typ == "send_message":
-                        if msg.get("group_id"):
-                            await self.send_group_chat(str(msg["group_id"]), str(msg.get("text", "")))
-                        else:
-                            await self.send_chat(msg["pubkey"], str(msg.get("text", "")))
-                    elif typ == "send_file":
-                        filename = safe_filename(msg.get("filename"))
-                        data = str(msg.get("data", ""))
-                        if msg.get("group_id"):
-                            await self.send_group_file(str(msg["group_id"]), filename, data)
-                        else:
-                            await self.send_file(msg["pubkey"], filename, data, msg.get("group_id"))
-                    elif typ == "create_group":
-                        group_id = str(uuid.uuid4())
-                        name = validate_label(msg.get("name"), "Group name", MAX_GROUP_NAME_CHARS) or f"Group {group_id[:8]}"
-                        members_raw = msg.get("members", [])
-                        if not isinstance(members_raw, list) or len(members_raw) > MAX_GROUP_MEMBERS:
-                            raise ValueError(f"Group members must be a list of at most {MAX_GROUP_MEMBERS}")
-                        self.db.create_group(group_id, name, self.public_key)
-                        for member in members_raw:
-                            member = self.validate_peer_key(member)
-                            if self.db.is_friend(member):
-                                self.db.add_group_member(group_id, member)
-                                if member in self.sessions:
-                                    invite = {"group_id": group_id, "name": name, "members": self.db.group_members(group_id), "from": self.public_key, "to": member, "epoch": 1}
-                                    await self.send_relay(member, self.signed_payload("group_invite", invite), queue_on_failure=True)
-                        await self.broadcast_ui(self.state_payload())
-                    elif typ == "refresh":
-                        await ws.send(json.dumps(self.state_payload()))
-                    else:
-                        raise ValueError(f"Unknown command: {typ}")
+                    await self._dispatch_ui(msg)
                 except Exception as exc:
                     LOG.warning("UI command rejected: %s", exc)
-                    await ws.send(json.dumps({"type": "notice", "level": "error", "text": str(exc)}))
+                    await ws.send(json.dumps({
+                        "type": "notice", "level": "error", "text": str(exc)
+                    }))
         finally:
             self.ui_clients.discard(ws)
 
+    async def _dispatch_ui(self, msg: Dict[str, Any]) -> None:
+        typ = msg.get("type")
+        if typ == "add_friend":
+            pubkey = self.validate_peer_key(msg["pubkey"])
+            if pubkey == self.public_key:
+                raise ValueError("You cannot add your own public key as a friend")
+            self.db.add_friend(pubkey, msg.get("nickname"))
+            await self.broadcast_ui(self.state_payload())
+        elif typ == "remove_friend":
+            self.db.remove_friend(self.validate_peer_key(msg["pubkey"]))
+            await self.broadcast_ui(self.state_payload())
+        elif typ == "connect":
+            await self.connect_peer(msg["pubkey"])
+        elif typ == "send_message":
+            if msg.get("group_id"):
+                await self.send_group_chat(str(msg["group_id"]), str(msg.get("text", "")))
+            else:
+                await self.send_chat(msg["pubkey"], str(msg.get("text", "")))
+        elif typ == "send_file":
+            filename = safe_filename(msg.get("filename"))
+            data = str(msg.get("data", ""))
+            if msg.get("group_id"):
+                await self.send_group_file(str(msg["group_id"]), filename, data)
+            else:
+                await self.send_file(msg["pubkey"], filename, data, msg.get("group_id"))
+        elif typ == "create_group":
+            group_id = str(uuid.uuid4())
+            name = (validate_label(msg.get("name"), "Group name", MAX_GROUP_NAME_CHARS)
+                    or f"Group {group_id[:8]}")
+            members_raw = msg.get("members", [])
+            if not isinstance(members_raw, list) or len(members_raw) > MAX_GROUP_MEMBERS:
+                raise ValueError(f"Group members must be a list of at most {MAX_GROUP_MEMBERS}")
+            self.db.create_group(group_id, name, self.public_key)
+            for member in members_raw:
+                member = self.validate_peer_key(member)
+                if self.db.is_friend(member):
+                    self.db.add_group_member(group_id, member)
+                    if member in self.sessions:
+                        invite = {
+                            "group_id": group_id, "name": name,
+                            "members": self.db.group_members(group_id),
+                            "from": self.public_key, "to": member, "epoch": 1,
+                        }
+                        await self.send_relay(
+                            member, self.signed_payload("group_invite", invite),
+                            queue_on_failure=True
+                        )
+            await self.broadcast_ui(self.state_payload())
+        elif typ == "typing":
+            await self.send_typing(msg["pubkey"], bool(msg.get("active", True)))
+        elif typ == "read_receipt":
+            await self.send_read_receipt(msg["pubkey"], str(msg["msg_id"]))
+            self.db.clear_unread(msg["pubkey"])
+            await self.broadcast_ui(self.state_payload())
+        elif typ == "reaction":
+            await self.send_reaction(
+                msg["pubkey"], str(msg["msg_id"]),
+                str(msg["emoji"]), str(msg.get("action", "add"))
+            )
+        elif typ == "clear_unread":
+            self.db.clear_unread(self.validate_peer_key(msg["pubkey"]))
+            await self.broadcast_ui(self.state_payload())
+        elif typ == "refresh":
+            await self.broadcast_ui(self.state_payload())
+        else:
+            raise ValueError(f"Unknown command: {typ}")
+
+    # ── Signaling loop ────────────────────────────────────────────────────────
 
     async def connect_signaling_loop(self) -> None:
         websockets = require_websockets()
+        delay = 1.0
         while True:
             try:
-                async with websockets.connect(self.signaling_url, max_size=MAX_FILE_BYTES * 2) as ws:
+                async with websockets.connect(
+                    self.signaling_url, max_size=MAX_FILE_BYTES * 2
+                ) as ws:
                     self.signaling_ws = ws
+                    delay = 1.0  # reset backoff on success
                     try:
                         first_raw = await asyncio.wait_for(ws.recv(), timeout=2)
                         first = json.loads(first_raw)
                         if first.get("type") == "register_challenge":
-                            challenge = {"type": "register_challenge", "nonce": first["nonce"], "pubkey": self.public_key}
+                            challenge = {
+                                "type": "register_challenge",
+                                "nonce": first["nonce"],
+                                "pubkey": self.public_key,
+                            }
                             sig = b64e(self.crypto.sign(self.secret_key, canonical_json(challenge)))
-                            await ws.send(json.dumps({"type": "register", "pubkey": self.public_key, "signature": sig, "challenge": first["nonce"]}))
+                            await ws.send(json.dumps({
+                                "type": "register", "pubkey": self.public_key,
+                                "signature": sig, "challenge": first["nonce"],
+                            }))
                         else:
-                            await ws.send(json.dumps({"type": "register", "pubkey": self.public_key}))
+                            await ws.send(json.dumps({
+                                "type": "register", "pubkey": self.public_key
+                            }))
                             await self._handle_signaling_message(first)
                     except asyncio.TimeoutError:
-                        await ws.send(json.dumps({"type": "register", "pubkey": self.public_key}))
-                    await self.broadcast_ui({"type": "notice", "level": "success", "text": f"Connected to signaling server {self.signaling_url}"})
+                        await ws.send(json.dumps({
+                            "type": "register", "pubkey": self.public_key
+                        }))
+                    await self.broadcast_ui({
+                        "type": "notice", "level": "success",
+                        "text": f"Connected to signaling server"
+                    })
                     async for raw in ws:
                         try:
                             await self._handle_signaling_message(json.loads(raw))
                         except Exception as exc:
                             LOG.warning("Ignored malformed signaling message: %s", exc)
-                            await self.broadcast_ui({"type": "notice", "level": "warning", "text": f"Ignored malformed signaling payload: {exc}"})
             except Exception as exc:
                 self.signaling_ws = None
-                await self.broadcast_ui({"type": "notice", "level": "warning", "text": f"Signaling disconnected: {exc}. Reconnecting…"})
-                await asyncio.sleep(3)
+                LOG.warning("Signaling disconnected: %s", exc)
+                await self.broadcast_ui({
+                    "type": "notice", "level": "warning",
+                    "text": f"Disconnected from relay — reconnecting in {delay:.0f}s…"
+                })
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
     async def _handle_signaling_message(self, msg: Dict[str, Any]) -> None:
         if msg.get("type") == "peers":
@@ -1003,9 +1575,13 @@ class QuantumNode:
         elif msg.get("type") == "relay":
             await self.handle_relay_payload(msg["from"], msg["payload"])
         elif msg.get("type") == "error":
-            await self.broadcast_ui({"type": "notice", "level": "error", "text": msg.get("text", "signaling error")})
+            await self.broadcast_ui({
+                "type": "notice", "level": "error",
+                "text": msg.get("text", "signaling error")
+            })
 
 
+# ─── Signaling Server ─────────────────────────────────────────────────────────
 
 class SignalingServer:
     def __init__(self) -> None:
@@ -1040,35 +1616,61 @@ class SignalingServer:
                 try:
                     msg = json.loads(raw)
                     if msg.get("type") == "register":
-                        candidate = validate_public_key(msg["pubkey"], self.crypto.sign_public_key_bytes)
+                        candidate = validate_public_key(
+                            msg["pubkey"], self.crypto.sign_public_key_bytes
+                        )
                         sig = msg.get("signature")
                         if sig:
-                            challenge = {"type": "register_challenge", "nonce": msg.get("challenge"), "pubkey": candidate}
-                            if msg.get("challenge") != nonce or not self.crypto.verify(bytes.fromhex(candidate), canonical_json(challenge), b64d(sig)):
-                                await ws.send(json.dumps({"type": "error", "text": "Invalid registration signature"}))
+                            challenge = {
+                                "type": "register_challenge",
+                                "nonce": msg.get("challenge"),
+                                "pubkey": candidate,
+                            }
+                            if (msg.get("challenge") != nonce
+                                    or not self.crypto.verify(
+                                        bytes.fromhex(candidate),
+                                        canonical_json(challenge), b64d(sig)
+                                    )):
+                                await ws.send(json.dumps({
+                                    "type": "error", "text": "Invalid registration signature"
+                                }))
                                 continue
                         elif candidate in self.clients:
-                            await ws.send(json.dumps({"type": "error", "text": "Duplicate unsigned registration rejected"}))
+                            await ws.send(json.dumps({
+                                "type": "error",
+                                "text": "Duplicate unsigned registration rejected"
+                            }))
                             continue
                         pubkey = candidate
                         old = self.clients.get(pubkey)
                         if old and old is not ws:
-                            await old.close(code=1008, reason="Replaced by a signed registration")
+                            await old.close(code=1008, reason="Replaced by signed registration")
                         self.clients[pubkey] = ws
                         await self.broadcast_peers()
                     elif msg.get("type") == "relay":
                         if not pubkey:
-                            await ws.send(json.dumps({"type": "error", "text": "Register before relaying"}))
+                            await ws.send(json.dumps({
+                                "type": "error", "text": "Register before relaying"
+                            }))
                             continue
-                        target = validate_public_key(msg.get("to", ""), self.crypto.sign_public_key_bytes)
+                        target = validate_public_key(
+                            msg.get("to", ""), self.crypto.sign_public_key_bytes
+                        )
                         payload = msg.get("payload")
-                        if not isinstance(payload, dict) or len(json.dumps(payload)) > MAX_FILE_BYTES * 2:
-                            await ws.send(json.dumps({"type": "error", "text": "Invalid relay payload"}))
+                        if (not isinstance(payload, dict)
+                                or len(json.dumps(payload)) > MAX_FILE_BYTES * 2):
+                            await ws.send(json.dumps({
+                                "type": "error", "text": "Invalid relay payload"
+                            }))
                             continue
                         if target in self.clients:
-                            await self.clients[target].send(json.dumps({"type": "relay", "from": pubkey, "payload": payload}))
+                            await self.clients[target].send(json.dumps({
+                                "type": "relay", "from": pubkey, "payload": payload
+                            }))
                         else:
-                            await ws.send(json.dumps({"type": "error", "text": "Peer is offline"}))
+                            await ws.send(json.dumps({
+                                "type": "error", "text": "Peer is offline"
+                            }))
                 except Exception as exc:
                     LOG.warning("Rejected signaling frame: %s", exc)
                     await ws.send(json.dumps({"type": "error", "text": str(exc)}))
@@ -1079,6 +1681,7 @@ class SignalingServer:
                 await self.broadcast_peers()
 
 
+# ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -1089,13 +1692,27 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
     ui_ws_port: int = UI_WS_PORT
 
     def do_GET(self) -> None:
-        if self.path == "/":
-            body = HTML.replace("__UI_WS_PORT__", str(self.ui_ws_port)).replace("__UI_TOKEN__", self.node.ui_token if self.node else "").encode("utf-8")
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            body = (
+                HTML
+                .replace("__UI_WS_PORT__", str(self.ui_ws_port))
+                .replace("__UI_TOKEN__", self.node.ui_token if self.node else "")
+                .replace("__VERSION__", VERSION)
+            ).encode("utf-8")
             self._send(200, body, "text/html; charset=utf-8")
             return
-        if self.path.startswith("/files/"):
+
+        if path == "/health":
+            body = json.dumps(self.node.health() if self.node else {"status": "no node"}).encode()
+            self._send(200, body, "application/json")
+            return
+
+        if path.startswith("/files/"):
             try:
-                file_id = validate_file_id(urlparse(self.path).path.rsplit("/", 1)[-1])
+                file_id = validate_file_id(path.rsplit("/", 1)[-1])
             except ValueError:
                 self.send_error(404, "File not found")
                 return
@@ -1105,22 +1722,35 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
                 return
             ctype = mimetypes.guess_type(meta["filename"])[0] or "application/octet-stream"
             stored = Path(meta["storage_path"]).read_bytes()
-            data = self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce")) if self.node else stored
+            data = (self.node.decrypt_from_disk(stored, file_id, meta.get("file_nonce"))
+                    if self.node else stored)
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(meta['filename'])}")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{quote(meta['filename'])}"
+            )
             self._security_headers(download=True)
             self.end_headers()
             self.wfile.write(data)
             return
+
         self.send_error(404)
 
     def _security_headers(self, download: bool = False) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
+            "style-src 'unsafe-inline' 'self'; "
+            "script-src 'unsafe-inline' 'self'; "
+            "img-src 'self' data: blob:; "
+            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        )
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
@@ -1131,82 +1761,1667 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write("[http] " + fmt % args + "\n")
+        LOG.debug("[http] " + fmt, *args)
 
 
-HTML = r"""
-<!doctype html>
+# ─── Embedded UI ──────────────────────────────────────────────────────────────
+
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Quantum Chat</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚛ Quantum Chat</title>
 <style>
-:root{color-scheme:dark;--bg:#06101d;--panel:#0f1c2e;--panel2:#13243a;--muted:#96a9c4;--line:#274061;--accent:#67e8a5;--danger:#ff6b81;--warn:#ffd166;--text:#edf5ff;--blue:#79abff}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 18% 0,#203b6c 0,#0a1627 38%,var(--bg) 100%);color:var(--text);font:15px/1.45 Inter,system-ui,Segoe UI,sans-serif}.app{max-width:1360px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.top h1{margin:.1rem 0;font-size:34px}.top p{margin:.25rem 0;color:var(--muted)}.badge{border:1px solid var(--line);padding:7px 12px;border-radius:999px;color:var(--accent);white-space:nowrap}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.stat{background:rgba(15,28,46,.85);border:1px solid var(--line);border-radius:16px;padding:12px}.stat b{display:block;font-size:24px}.stat span{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.grid{display:grid;grid-template-columns:340px 1fr 290px;gap:16px}.card{background:rgba(15,28,46,.9);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 12px 30px #0005}.card h3{margin:0 0 10px}.key{font-family:ui-monospace,monospace;word-break:break-all;color:#d2e5ff;background:#07111f;border:1px solid var(--line);border-radius:12px;padding:10px;max-height:112px;overflow:auto}.row{display:flex;gap:8px;margin-top:10px;align-items:center}input,select,textarea{width:100%;background:#07111f;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:10px}button{background:linear-gradient(135deg,#326bff,#715aff);border:0;border-radius:12px;color:#fff;font-weight:750;padding:10px 13px;cursor:pointer}button.secondary{background:#223656}button.danger{background:#7f1d35}button:disabled{opacity:.48;cursor:not-allowed}.list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:330px;overflow:auto}.item{border:1px solid var(--line);border-radius:14px;padding:10px;background:#0b1627;cursor:pointer}.item.active{border-color:var(--accent);box-shadow:0 0 0 1px #67e8a555}.item small{display:block;color:var(--muted);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis}.pill{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:999px;padding:2px 8px;color:var(--muted);font-size:12px}.pill.secure{border-color:var(--accent);color:var(--accent)}.pill.online{border-color:var(--blue);color:var(--blue)}.chat-head{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}.chat{height:565px;overflow:auto;display:flex;flex-direction:column;gap:10px;background:#07111f;border:1px solid var(--line);border-radius:16px;padding:14px}.empty{margin:auto;color:var(--muted);text-align:center}.msg{max-width:76%;padding:10px 12px;border-radius:16px;background:#162845}.msg.out{align-self:flex-end;background:#214c70}.msg .meta{font-size:12px;color:var(--muted);margin-bottom:4px}.composer{display:grid;grid-template-columns:1fr auto auto;gap:8px;margin-top:12px}.hint{color:var(--muted);font-size:12px;margin-top:6px}.files a{color:var(--accent);text-decoration:none}.toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:10}.toast div{padding:12px 14px;border-radius:12px;background:#15233a;border:1px solid var(--line);max-width:420px}.toast .error{border-color:var(--danger)}.toast .warning{border-color:var(--warn)}.toast .success{border-color:var(--accent)}@media(max-width:1100px){.grid{grid-template-columns:330px 1fr}.right{grid-column:1/-1}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.grid,.stats,.composer{grid-template-columns:1fr}.top{display:block}.app{padding:14px}}
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --bg:       #080d18;
+  --s1:       #0c1220;
+  --s2:       #101827;
+  --s3:       #151f32;
+  --s4:       #1c2a40;
+  --border:   #1e2d47;
+  --border2:  #263652;
+  --accent:   #4d8ef5;
+  --accent2:  #34d39a;
+  --danger:   #f06a7a;
+  --warn:     #f9be3e;
+  --text1:    #e2eaf8;
+  --text2:    #7d94b8;
+  --text3:    #4a5c7a;
+  --out-bg:   #132545;
+  --out-border:#1e3860;
+  --in-bg:    #111d30;
+  --rad:      14px;
+  --font:     'DM Sans', system-ui, sans-serif;
+  --mono:     'JetBrains Mono', ui-monospace, monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text1);
+  height: 100vh;
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── Layout ── */
+#app { display: flex; height: 100vh; }
+
+#sidebar {
+  width: 300px;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  background: var(--s1);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg);
+}
+
+#panel {
+  width: 270px;
+  min-width: 270px;
+  background: var(--s1);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+/* ── Sidebar ── */
+.sidebar-head {
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--s2);
+}
+
+.app-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.app-logo .icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.app-logo h1 {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text1);
+}
+
+.app-logo .ver {
+  font-size: 10px;
+  color: var(--text3);
+  font-family: var(--mono);
+  margin-top: 1px;
+}
+
+.conn-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  color: var(--text2);
+  transition: all 0.3s;
+}
+
+.conn-badge.connected { border-color: var(--accent2); color: var(--accent2); }
+.conn-badge.connected .dot { background: var(--accent2); }
+.conn-badge .dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text3);
+  transition: background 0.3s;
+}
+.conn-badge.connected .dot { animation: pulse 2s infinite; }
+@keyframes pulse {
+  0%,100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.85); }
+}
+
+/* Identity card */
+.id-card {
+  margin: 12px 16px;
+  padding: 12px;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--rad);
+  cursor: pointer;
+}
+.id-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.id-avatar {
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), #7c5df5);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.id-name { font-weight: 600; font-size: 13px; }
+.id-fp {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text3);
+  letter-spacing: 0.05em;
+}
+.id-key {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text2);
+  word-break: break-all;
+  padding: 6px 8px;
+  background: var(--s1);
+  border-radius: 8px;
+  display: none;
+  margin-top: 8px;
+  line-height: 1.6;
+}
+.id-key.visible { display: block; }
+.id-actions {
+  display: flex; gap: 6px; margin-top: 8px;
+}
+
+/* Search */
+.search-wrap {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.search-input {
+  width: 100%;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px 8px 32px;
+  color: var(--text1);
+  font-size: 13px;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color 0.2s;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%234a5c7a' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 10px center;
+}
+.search-input:focus { border-color: var(--accent); }
+.search-input::placeholder { color: var(--text3); }
+
+/* Friend / group lists */
+.list-section { flex: 1; overflow-y: auto; padding: 8px 0; }
+.section-label {
+  padding: 6px 16px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.section-label button {
+  font-size: 18px;
+  color: var(--text3);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  transition: color 0.2s;
+}
+.section-label button:hover { color: var(--accent); }
+
+.friend-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: background 0.15s;
+  border-radius: 0;
+  position: relative;
+}
+.friend-item:hover { background: var(--s3); }
+.friend-item.active { background: var(--s4); }
+.friend-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 6px; bottom: 6px;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 0 3px 3px 0;
+}
+
+.friend-avatar {
+  position: relative;
+  flex-shrink: 0;
+}
+.avatar-circle {
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #2a4a8f, #3a2d7a);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: #c0d4ff;
+}
+.online-dot {
+  position: absolute;
+  bottom: 1px; right: 1px;
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--s1);
+  display: flex; align-items: center; justify-content: center;
+}
+.online-dot::after {
+  content: '';
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text3);
+}
+.online-dot.online::after { background: var(--accent2); animation: pulse 2s infinite; }
+
+.friend-info { flex: 1; min-width: 0; }
+.friend-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.friend-preview {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.friend-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.unread-badge {
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 999px;
+  min-width: 18px;
+  text-align: center;
+}
+.secure-tag {
+  font-size: 10px;
+  color: var(--accent2);
+  font-family: var(--mono);
+}
+.time-tag {
+  font-size: 10px;
+  color: var(--text3);
+}
+
+/* ── Main chat area ── */
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--s1);
+  min-height: 66px;
+}
+.chat-header-avatar {
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #2a4a8f, #3a2d7a);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.chat-header-info { flex: 1; min-width: 0; }
+.chat-header-name { font-size: 15px; font-weight: 700; }
+.chat-header-sub {
+  font-size: 12px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-header-actions { display: flex; gap: 8px; }
+
+.messages-wrap {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  scroll-behavior: smooth;
+}
+
+/* Drop overlay */
+.drop-overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  background: rgba(8,13,24,0.85);
+  border: 2px dashed var(--accent);
+  border-radius: var(--rad);
+  z-index: 20;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 18px;
+  color: var(--accent);
+  pointer-events: none;
+}
+.drop-overlay.active { display: flex; }
+#main { position: relative; }
+
+/* Date divider */
+.date-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+  color: var(--text3);
+  font-size: 11px;
+}
+.date-divider::before, .date-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* Messages */
+.msg-group { display: flex; flex-direction: column; margin: 2px 0; }
+.msg-group.out { align-items: flex-end; }
+.msg-group.in { align-items: flex-start; }
+
+.msg-bubble {
+  max-width: 72%;
+  padding: 10px 14px;
+  border-radius: 18px;
+  position: relative;
+  word-break: break-word;
+  line-height: 1.5;
+  font-size: 14px;
+}
+.msg-group.out .msg-bubble {
+  background: var(--out-bg);
+  border: 1px solid var(--out-border);
+  border-bottom-right-radius: 4px;
+}
+.msg-group.in .msg-bubble {
+  background: var(--in-bg);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+
+.msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text3);
+  padding: 0 4px;
+}
+.msg-group.out .msg-meta { flex-direction: row-reverse; }
+
+.msg-status { display: flex; align-items: center; }
+.check { color: var(--text3); font-size: 13px; }
+.check.delivered { color: var(--text2); }
+.check.read { color: var(--accent); }
+
+.msg-image {
+  max-width: 280px;
+  max-height: 200px;
+  border-radius: 10px;
+  display: block;
+  cursor: pointer;
+  object-fit: cover;
+}
+
+/* Reactions */
+.reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.reaction-chip:hover { border-color: var(--accent); }
+.reaction-chip.mine { border-color: var(--accent); background: rgba(77,142,245,0.1); }
+
+.reaction-bar {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  background: var(--s2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+  gap: 2px;
+  z-index: 10;
+  box-shadow: 0 4px 20px #0005;
+}
+.msg-group.out .reaction-bar { right: 0; }
+.msg-group.in .reaction-bar { left: 0; }
+.msg-bubble:hover .reaction-bar { display: flex; }
+.reaction-btn {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.15s;
+}
+.reaction-btn:hover { background: var(--s4); }
+
+/* Typing indicator */
+#typing-indicator {
+  padding: 0 20px 8px;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text2);
+}
+.typing-dots {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+.typing-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text3);
+  animation: bounce 1.4s infinite ease-in-out;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes bounce {
+  0%,80%,100% { transform: translateY(0); opacity: 0.4; }
+  40% { transform: translateY(-4px); opacity: 1; }
+}
+
+/* Composer */
+.composer {
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--s1);
+}
+.composer-inner {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 8px 12px;
+  transition: border-color 0.2s;
+}
+.composer-inner:focus-within { border-color: var(--accent); }
+#text {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text1);
+  font-family: var(--font);
+  font-size: 14px;
+  resize: none;
+  max-height: 120px;
+  min-height: 24px;
+  line-height: 1.5;
+}
+#text::placeholder { color: var(--text3); }
+.composer-actions { display: flex; align-items: center; gap: 4px; }
+.icon-btn {
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer;
+  color: var(--text3);
+  border-radius: 8px;
+  font-size: 18px;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover { background: var(--s4); color: var(--text1); }
+.send-btn {
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--accent);
+  border: none; cursor: pointer;
+  color: #fff;
+  border-radius: 8px;
+  font-size: 16px;
+  transition: opacity 0.15s, transform 0.1s;
+  flex-shrink: 0;
+}
+.send-btn:hover { opacity: 0.85; }
+.send-btn:active { transform: scale(0.93); }
+.send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.char-hint {
+  font-size: 11px;
+  color: var(--text3);
+  text-align: right;
+  margin-top: 4px;
+  font-family: var(--mono);
+}
+
+/* ── Right panel ── */
+.panel-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.panel-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text3);
+  margin-bottom: 10px;
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.stat-box {
+  background: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  text-align: center;
+}
+.stat-box b { display: block; font-size: 20px; font-weight: 700; }
+.stat-box span { font-size: 10px; color: var(--text3); text-transform: uppercase; }
+
+.session-item {
+  padding: 8px 10px;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.session-item-name { font-weight: 600; margin-bottom: 2px; }
+.session-item-meta { color: var(--text2); font-family: var(--mono); font-size: 10px; }
+.session-age {
+  font-size: 10px;
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.session-age .bar {
+  flex: 1;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.session-age .fill {
+  height: 100%;
+  background: var(--accent2);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+.session-age .fill.warn { background: var(--warn); }
+.session-age .fill.danger { background: var(--danger); }
+
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 6px;
+}
+.file-icon { font-size: 20px; flex-shrink: 0; }
+.file-info { flex: 1; min-width: 0; }
+.file-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-meta { font-size: 10px; color: var(--text2); }
+.file-dl {
+  font-size: 18px;
+  color: var(--text3);
+  text-decoration: none;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+.file-dl:hover { color: var(--accent); }
+
+/* ── Add friend / group panels ── */
+.slide-panel {
+  background: var(--s2);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.3s ease;
+}
+.slide-panel.open { max-height: 300px; }
+.slide-panel-inner { padding: 12px 16px; }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 10px;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn:active { transform: scale(0.97); }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { opacity: 0.85; }
+.btn-secondary { background: var(--s4); color: var(--text1); border: 1px solid var(--border); }
+.btn-secondary:hover { border-color: var(--border2); }
+.btn-danger { background: rgba(240,106,122,0.15); color: var(--danger); border: 1px solid rgba(240,106,122,0.3); }
+.btn-danger:hover { background: rgba(240,106,122,0.25); }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+
+/* ── Inputs ── */
+.field {
+  width: 100%;
+  background: var(--s1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  color: var(--text1);
+  font-family: var(--font);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s;
+  margin-bottom: 8px;
+}
+.field:focus { border-color: var(--accent); }
+.field::placeholder { color: var(--text3); }
+
+/* ── Toast ── */
+#toasts {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  z-index: 100;
+  max-width: 360px;
+}
+.toast {
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: var(--s2);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  animation: slideIn 0.25s ease;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.toast.info { border-color: var(--accent); }
+.toast.success { border-color: var(--accent2); }
+.toast.error { border-color: var(--danger); }
+.toast.warning { border-color: var(--warn); }
+.toast-icon { flex-shrink: 0; font-size: 16px; }
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* ── Empty states ── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 12px;
+  color: var(--text3);
+  text-align: center;
+  padding: 40px;
+}
+.empty-state .emo { font-size: 40px; }
+.empty-state h3 { font-size: 15px; color: var(--text2); }
+.empty-state p { font-size: 13px; max-width: 240px; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+/* ── Mode selector ── */
+.mode-tabs {
+  display: flex;
+  gap: 0;
+  margin: 8px 16px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.mode-tab {
+  flex: 1;
+  padding: 7px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--s2);
+  color: var(--text2);
+  border: none;
+  transition: all 0.15s;
+}
+.mode-tab.active { background: var(--accent); color: #fff; }
+
+/* ── Misc ── */
+.muted { color: var(--text2); }
+.mono { font-family: var(--mono); }
+
+@media (max-width: 900px) {
+  #panel { display: none; }
+}
+@media (max-width: 640px) {
+  #sidebar { width: 60px; min-width: 60px; }
+  .friend-info, .id-key, .search-wrap, .mode-tabs,
+  .section-label span, .friend-name, .unread-badge { display: none; }
+  .friend-avatar { margin: 0 auto; }
+  .sidebar-head .conn-badge span { display: none; }
+}
 </style>
 </head>
 <body>
-<div class="app">
-  <div class="top"><div><h1>⚛ Quantum Chat</h1><p>Post-quantum end-to-end encrypted chat with friend trust, session health, encrypted files, and group fan-out.</p></div><div class="badge" id="status">connecting UI…</div></div>
-  <section class="stats"><div class="stat"><b id="statFriends">0</b><span>friends</span></div><div class="stat"><b id="statOnline">0</b><span>online</span></div><div class="stat"><b id="statSessions">0</b><span>secure sessions</span></div><div class="stat"><b id="statFiles">0</b><span>files</span></div></section>
-  <div class="grid">
-    <aside>
-      <div class="card"><h3>Your identity</h3><div class="key" id="myKey">loading…</div><div class="row"><button class="secondary" onclick="copyKey()">Copy public key</button><button class="secondary" onclick="refresh()">Refresh</button></div></div>
-      <div class="card"><h3>Friends</h3><input id="friendKey" placeholder="Friend public key"><input id="friendName" placeholder="Nickname (optional)" style="margin-top:8px"><div class="row"><button onclick="addFriend()">Add</button><button class="secondary" onclick="connectSelected()">Connect selected</button></div><div class="list" id="friends"></div></div>
-      <div class="card"><h3>Groups</h3><input id="groupName" placeholder="Group name"><input id="groupMembers" placeholder="Member public keys, comma-separated" style="margin-top:8px"><button style="margin-top:8px" onclick="createGroup()">Create group</button><p class="hint">Tip: leave members empty to use the selected friend.</p><div class="list" id="groups"></div></div>
-    </aside>
-    <main class="card">
-      <div class="chat-head"><div><select id="target"></select><div class="hint" id="targetHint">Choose a friend or group.</div></div><select id="mode"><option value="friend">Friend</option><option value="group">Group</option></select></div>
-      <input id="search" placeholder="Filter visible messages…" style="margin-top:10px" oninput="renderMessages()">
-      <div class="chat" id="chat"></div>
-      <div class="composer"><textarea id="text" rows="2" placeholder="Type encrypted message…" oninput="updateComposer()" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea><button id="sendBtn" onclick="sendMessage()">Send</button><label><button type="button" onclick="document.getElementById('file').click()">File</button><input id="file" type="file" hidden onchange="sendFile()"></label></div><div class="hint" id="charCount">0 / 65536 bytes</div>
-    </main>
-    <aside class="right">
-      <div class="card"><h3>Session health</h3><div class="list" id="sessions"></div></div>
-      <div class="card files"><h3>Encrypted files</h3><div class="list" id="files"></div></div>
-    </aside>
-  </div>
-</div><div class="toast" id="toast"></div>
+<div id="app">
+  <!-- ── Sidebar ─────────────────────────── -->
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <div class="app-logo">
+        <span class="icon">⚛</span>
+        <div>
+          <h1>Quantum Chat</h1>
+          <div class="ver">v__VERSION__</div>
+        </div>
+      </div>
+      <div class="conn-badge" id="connBadge">
+        <span class="dot"></span>
+        <span id="connText">connecting…</span>
+      </div>
+    </div>
+
+    <!-- Identity card -->
+    <div class="id-card" onclick="toggleId()">
+      <div class="id-card-head">
+        <div class="id-avatar">⚛</div>
+        <div>
+          <div class="id-name">Your Identity</div>
+          <div class="id-fp mono" id="myFp">loading…</div>
+        </div>
+      </div>
+      <div class="id-key" id="myKey">loading…</div>
+      <div class="id-actions" id="idActions" style="display:none">
+        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();copyKey()">Copy key</button>
+      </div>
+    </div>
+
+    <!-- Mode tabs -->
+    <div class="mode-tabs">
+      <button class="mode-tab active" id="tabFriends" onclick="setMode('friends')">Friends</button>
+      <button class="mode-tab" id="tabGroups" onclick="setMode('groups')">Groups</button>
+    </div>
+
+    <!-- Search -->
+    <div class="search-wrap">
+      <input class="search-input" id="sideSearch" placeholder="Search…" oninput="renderSidebar()">
+    </div>
+
+    <!-- Add Friend panel -->
+    <div class="slide-panel" id="addPanel">
+      <div class="slide-panel-inner">
+        <input class="field" id="friendKey" placeholder="Friend public key">
+        <input class="field" id="friendName" placeholder="Nickname (optional)">
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary" style="flex:1" onclick="addFriend()">Add friend</button>
+          <button class="btn btn-secondary" onclick="toggleAdd()">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Group panel -->
+    <div class="slide-panel" id="groupPanel">
+      <div class="slide-panel-inner">
+        <input class="field" id="groupName" placeholder="Group name">
+        <input class="field" id="groupMembers" placeholder="Member keys, comma-separated (or leave empty)">
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary" style="flex:1" onclick="createGroup()">Create</button>
+          <button class="btn btn-secondary" onclick="toggleGroup()">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="list-section" id="listSection"></div>
+  </aside>
+
+  <!-- ── Main chat ───────────────────────── -->
+  <main id="main">
+    <!-- Chat header -->
+    <div class="chat-header" id="chatHeader">
+      <div class="empty-state" style="flex-direction:row;padding:0;flex:1">
+        <span style="color:var(--text3);font-size:13px">← Select a friend or group to start chatting</span>
+      </div>
+    </div>
+
+    <!-- Messages -->
+    <div class="messages-wrap" id="messages">
+      <div class="empty-state">
+        <div class="emo">🔐</div>
+        <h3>Post-quantum encrypted</h3>
+        <p>All messages are encrypted with Kyber-512 + AES-256-GCM. Select a contact to start.</p>
+      </div>
+    </div>
+
+    <!-- Typing indicator -->
+    <div id="typing-indicator"></div>
+
+    <!-- Drop overlay -->
+    <div class="drop-overlay" id="dropOverlay">
+      <div style="font-size:36px">📎</div>
+      <div>Drop file to send encrypted</div>
+    </div>
+
+    <!-- Composer -->
+    <div class="composer">
+      <div class="composer-inner">
+        <textarea id="text" rows="1" placeholder="Type an encrypted message…"
+          oninput="onTextInput()" onkeydown="onTextKey(event)"></textarea>
+        <div class="composer-actions">
+          <label class="icon-btn" title="Attach file">
+            📎
+            <input id="fileInput" type="file" hidden onchange="sendFile()">
+          </label>
+          <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled title="Send">➤</button>
+        </div>
+      </div>
+      <div class="char-hint" id="charHint">0 / 65536</div>
+    </div>
+  </main>
+
+  <!-- ── Right panel ─────────────────────── -->
+  <aside id="panel">
+    <div class="panel-section">
+      <div class="panel-title">Overview</div>
+      <div class="stat-row">
+        <div class="stat-box"><b id="statFriends">0</b><span>friends</span></div>
+        <div class="stat-box"><b id="statOnline">0</b><span>online</span></div>
+        <div class="stat-box"><b id="statSessions">0</b><span>sessions</span></div>
+        <div class="stat-box"><b id="statFiles">0</b><span>files</span></div>
+      </div>
+    </div>
+    <div class="panel-section" id="panelSessions">
+      <div class="panel-title">Secure sessions</div>
+      <div id="sessionList"><span class="muted" style="font-size:12px">No sessions yet</span></div>
+    </div>
+    <div class="panel-section" id="panelFiles">
+      <div class="panel-title">Recent files</div>
+      <div id="fileList"><span class="muted" style="font-size:12px">No files yet</span></div>
+    </div>
+  </aside>
+</div>
+
+<!-- Toasts -->
+<div id="toasts"></div>
+
 <script>
-let ws,state={friends:[],groups:[],messages:[],files:[],online:[],sessions:{}},selectedFriend=null;
+// ─── State ──────────────────────────────────────────────────────────────────
 const UI_WS_PORT = __UI_WS_PORT__;
 const UI_TOKEN = "__UI_TOKEN__";
-function $(id){return document.getElementById(id)}
-function connect(){let scheme=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(`${scheme}://${location.hostname}:${UI_WS_PORT}/?token=${encodeURIComponent(UI_TOKEN)}`);ws.onopen=()=>status('UI connected');ws.onclose=()=>{status('UI disconnected · retrying');setTimeout(connect,1500)};ws.onmessage=e=>handle(JSON.parse(e.data));}
-function status(t){$('status').textContent=t}
-function handle(d){if(d.type==='state'){state=d;render()}else if(d.type==='notice'){toast(d.text,d.level)}else if(d.type==='message'){state.messages.push(d.message);renderMessages()}else if(d.type==='file'){state.files.unshift(d.file);renderFiles();toast(`File ${d.file.filename} received/sent`,'success')}}
-function render(){ $('myKey').textContent=state.public_key||'';$('statFriends').textContent=state.friends.length;$('statOnline').textContent=state.online.length;$('statSessions').textContent=Object.keys(state.sessions||{}).length;$('statFiles').textContent=(state.files||[]).length;renderFriends();renderGroups();renderTargets();renderSessions();renderFiles();renderMessages();updateComposer();}
-function renderFriends(){let el=$('friends');el.innerHTML='';state.friends.forEach(f=>{let online=state.online.includes(f.pubkey), secure=state.sessions&&state.sessions[f.pubkey], div=document.createElement('div');div.className='item '+(selectedFriend===f.pubkey?'active':'');div.onclick=()=>{selectedFriend=f.pubkey;$('mode').value='friend';renderTargets();renderFriends();renderMessages()};div.innerHTML=`<b>${online?'🟢':'⚪'} ${escapeHtml(f.nickname||short(f.pubkey))}</b><small>${f.pubkey}</small><div class="row"><span class="pill ${online?'online':''}">${online?'online':'offline'}</span><span class="pill ${secure?'secure':''}">${secure?'secure':'no session'}</span></div><div class="row"><button onclick="event.stopPropagation();selectedFriend='${f.pubkey}';connectSelected()">Connect</button><button class="danger" onclick="event.stopPropagation();removeFriend('${f.pubkey}')">Remove</button></div>`;el.appendChild(div)});if(!state.friends.length)el.innerHTML='<div class="hint">Add a friend public key to start.</div>'}
-function renderGroups(){let el=$('groups');el.innerHTML='';state.groups.forEach(g=>{let div=document.createElement('div');div.className='item';div.onclick=()=>{$('mode').value='group';renderTargets(g.group_id);renderMessages()};div.innerHTML=`<b>${escapeHtml(g.name)}</b><small>${g.group_id}</small><span class="pill">${(g.members||[]).length} members</span>`;el.appendChild(div)});if(!state.groups.length)el.innerHTML='<div class="hint">Create a group for pairwise encrypted fan-out.</div>'}
-function renderTargets(preferred){let t=$('target'),mode=$('mode').value,current=preferred||t.value;t.innerHTML='';let rows=mode==='friend'?state.friends:state.groups;rows.forEach(x=>{let o=document.createElement('option');o.value=mode==='friend'?x.pubkey:x.group_id;o.textContent=mode==='friend'?(x.nickname||short(x.pubkey)):x.name;t.appendChild(o)});if(selectedFriend&&mode==='friend')t.value=selectedFriend;else if(current)t.value=current;let target=currentTarget();$('targetHint').textContent=target?targetHint(target):'No target available yet.';updateComposer();}
-function renderMessages(){let el=$('chat'),target=currentTarget(),q=$('search').value.toLowerCase();el.innerHTML='';let rows=(state.messages||[]).filter(m=>matchesTarget(m,target)).filter(m=>!q||(m.body||'').toLowerCase().includes(q));rows.forEach(m=>{let div=document.createElement('div');div.className='msg '+(m.direction==='out'?'out':'in');div.innerHTML=`<div class="meta">${m.direction==='out'?'You':short(m.sender_pubkey)} · ${new Date((m.timestamp||Date.now()/1000)*1000).toLocaleString()}${m.group_id?' · group':''}</div><div></div>`;div.lastChild.textContent=m.body;el.appendChild(div)});if(!rows.length)el.innerHTML='<div class="empty">No messages for this view yet.</div>';el.scrollTop=el.scrollHeight;}
-function renderSessions(){let el=$('sessions');el.innerHTML='';let entries=Object.entries(state.sessions||{});entries.forEach(([peer,s])=>{let f=state.friends.find(x=>x.pubkey===peer), div=document.createElement('div');div.className='item';div.innerHTML=`<b>${escapeHtml(f?.nickname||short(peer))}</b><small>${peer}</small><span class="pill secure">established ${new Date(s.established_at*1000).toLocaleString()}</span>`;el.appendChild(div)});if(!entries.length)el.innerHTML='<div class="hint">Connect to a friend to establish a secure Kyber session.</div>'}
-function renderFiles(){let el=$('files');el.innerHTML='';(state.files||[]).forEach(f=>{let div=document.createElement('div');div.className='item';div.innerHTML=`<b>${escapeHtml(f.filename)}</b><small>${formatBytes(f.size)} · ${new Date(f.uploaded_at*1000).toLocaleString()}</small><a href="/files/${f.file_id}">Download</a>`;el.appendChild(div)});if(!(state.files||[]).length)el.innerHTML='<div class="hint">Encrypted file transfers appear here.</div>'}
-function currentTarget(){return {mode:$('mode').value,id:$('target').value}}
-function targetHint(t){if(t.mode==='friend'){let f=state.friends.find(x=>x.pubkey===t.id);return f?`${state.online.includes(t.id)?'Online':'Offline'} · ${state.sessions?.[t.id]?'secure session ready':'connect before sending'}`:'Choose a friend.'}let g=state.groups.find(x=>x.group_id===t.id);return g?`${(g.members||[]).length} members · encrypted separately to each reachable member`:'Choose a group.'}
-function matchesTarget(m,t){if(!t.id)return true;if(t.mode==='group')return m.group_id===t.id;return !m.group_id&&(m.sender_pubkey===t.id||m.recipient_pubkey===t.id)}
-function short(k){return k?`${k.slice(0,12)}…${k.slice(-8)}`:''}
-function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function formatBytes(n){if(!Number.isFinite(n))return '0 B';let u=['B','KB','MB','GB'],i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`}
-function send(o){if(!ws||ws.readyState!==1){toast('UI socket is not connected yet','warning');return}ws.send(JSON.stringify(o))}
-function addFriend(){send({type:'add_friend',pubkey:$('friendKey').value.trim(),nickname:$('friendName').value.trim()});$('friendKey').value='';$('friendName').value=''}
-function removeFriend(pubkey){if(confirm('Remove this friend and local session?'))send({type:'remove_friend',pubkey})}
-function connectSelected(){let pubkey=selectedFriend||$('target').value||$('friendKey').value.trim();if(pubkey)send({type:'connect',pubkey})}
-function sendMessage(){let text=$('text').value;if(!text.trim())return;let t=currentTarget();if(t.mode==='group')send({type:'send_message',group_id:t.id,text});else send({type:'send_message',pubkey:t.id,text});$('text').value='';updateComposer()}
-function sendFile(){let f=$('file').files[0],t=currentTarget();if(!f||!t.id)return;let r=new FileReader();r.onload=()=>{let data=r.result.split(',')[1];if(t.mode==='group')send({type:'send_file',group_id:t.id,filename:f.name,data});else send({type:'send_file',pubkey:t.id,filename:f.name,data})};r.readAsDataURL(f);$('file').value=''}
-function createGroup(){let typed=$('groupMembers').value.split(',').map(x=>x.trim()).filter(Boolean),members=typed.length?typed:(selectedFriend?[selectedFriend]:[]);send({type:'create_group',name:$('groupName').value.trim(),members});$('groupName').value='';$('groupMembers').value=''}
-function refresh(){send({type:'refresh'})}
-function copyKey(){navigator.clipboard.writeText(state.public_key||'');toast('Copied public key','success')}
-function updateComposer(){let bytes=new TextEncoder().encode($('text').value).length;$('charCount').textContent=`${bytes} / 65536 bytes`;$('sendBtn').disabled=!$('text').value.trim()||!$('target').value}
-function toast(t,l='info'){let e=document.createElement('div');e.className=l;e.textContent=t;$('toast').appendChild(e);setTimeout(()=>e.remove(),5500)}
-$('mode').onchange=()=>{renderTargets();renderMessages()};$('target').onchange=()=>{if($('mode').value==='friend')selectedFriend=$('target').value;renderMessages();renderTargets()};connect();
+
+let state = {
+  public_key: '', fingerprint: '', signaling_url: '',
+  online: [], friends: [], groups: [], messages: [],
+  files: [], sessions: {},
+};
+let ws = null;
+let mode = 'friends';          // 'friends' | 'groups'
+let selectedTarget = null;     // {type:'friend'|'group', id:string}
+let typing = {};               // peer_pubkey -> timestamp
+let typingTimer = null;
+let myTypingActive = false;
+let myTypingTimeout = null;
+let notificationsGranted = false;
+let unreadTitle = 0;
+let titleTimer = null;
+
+// ─── Utils ──────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const esc = s => String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const short = k => k ? k.slice(0,10)+'…'+k.slice(-6) : '';
+const fmt = n => {
+  if(!Number.isFinite(+n)) return '0 B';
+  let u=['B','KB','MB','GB'],i=0; n=+n;
+  while(n>=1024&&i<u.length-1){n/=1024;i++}
+  return `${n.toFixed(i?1:0)} ${u[i]}`;
+};
+const relTime = ts => {
+  if(!ts) return '';
+  const d = Date.now()/1000 - ts, m = Math.floor(d/60), h = Math.floor(d/3600), day = Math.floor(d/86400);
+  if(d < 60) return 'just now';
+  if(m < 60) return `${m}m ago`;
+  if(h < 24) return `${h}h ago`;
+  if(day < 7) return `${day}d ago`;
+  return new Date(ts*1000).toLocaleDateString();
+};
+const fullTime = ts => ts ? new Date(ts*1000).toLocaleString() : '';
+const dateLabel = ts => {
+  if(!ts) return '';
+  const d = new Date(ts*1000), today = new Date();
+  if(d.toDateString() === today.toDateString()) return 'Today';
+  const yesterday = new Date(today); yesterday.setDate(today.getDate()-1);
+  if(d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString(undefined, {weekday:'long',month:'short',day:'numeric'});
+};
+const fileIcon = name => {
+  const ext = (name||'').split('.').pop().toLowerCase();
+  const map = {png:'🖼️',jpg:'🖼️',jpeg:'🖼️',gif:'🖼️',webp:'🖼️',svg:'🖼️',
+               mp4:'🎬',mov:'🎬',avi:'🎬',webm:'🎬',mkv:'🎬',
+               mp3:'🎵',wav:'🎵',ogg:'🎵',flac:'🎵',aac:'🎵',
+               pdf:'📄',doc:'📄',docx:'📄',txt:'📄',md:'📄',
+               zip:'📦',tar:'📦',gz:'📦',rar:'📦',
+               py:'💻',js:'💻',ts:'💻',html:'💻',css:'💻',sh:'💻',
+  };
+  return map[ext] || '📎';
+};
+const isImage = name => /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(name||'');
+const avatarLetter = name => (name||'?').trim()[0].toUpperCase();
+const avatarColor = key => {
+  let h = 0;
+  for(let c of (key||'')) h = ((h<<5)-h) + c.charCodeAt(0);
+  const colors = ['#1a3a8f','#2a1a8f','#1a6a5f','#5a1a6f','#8f3a1a','#1a5a8f'];
+  return colors[Math.abs(h) % colors.length];
+};
+
+// ─── WebSocket ───────────────────────────────────────────────────────────────
+function wsConnect() {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${scheme}://${location.hostname}:${UI_WS_PORT}/?token=${encodeURIComponent(UI_TOKEN)}`);
+  ws.onopen = () => setConn(true);
+  ws.onclose = () => { setConn(false); setTimeout(wsConnect, 1500); };
+  ws.onerror = () => {};
+  ws.onmessage = e => handle(JSON.parse(e.data));
+}
+
+function setConn(connected) {
+  const b = $('connBadge'), t = $('connText');
+  b.className = 'conn-badge' + (connected ? ' connected' : '');
+  t.textContent = connected ? 'connected' : 'disconnected';
+}
+
+function send(obj) {
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  else toast('UI socket not connected', 'warning');
+}
+
+// ─── Message handler ─────────────────────────────────────────────────────────
+function handle(d) {
+  if(d.type === 'state') {
+    state = d;
+    render();
+  } else if(d.type === 'notice') {
+    toast(d.text, d.level || 'info');
+  } else if(d.type === 'message') {
+    state.messages.push(d.message);
+    const isSelected = selectedTarget &&
+      (selectedTarget.type === 'friend'
+        ? !d.message.group_id && (d.message.sender_pubkey === selectedTarget.id || d.message.recipient_pubkey === selectedTarget.id)
+        : d.message.group_id === selectedTarget.id);
+    if(!isSelected && d.message.direction === 'in') {
+      const friend = state.friends.find(f => f.pubkey === d.message.sender_pubkey);
+      const name = friend?.nickname || short(d.message.sender_pubkey);
+      notify(name, d.message.body);
+      bumpUnread(d.message.sender_pubkey);
+    }
+    renderMessages();
+    renderSidebar();
+    scrollBottom(false);
+    if(isSelected && d.message.direction === 'in') {
+      send({type:'clear_unread', pubkey: d.message.sender_pubkey});
+    }
+  } else if(d.type === 'file') {
+    state.files.unshift(d.file);
+    $('statFiles').textContent = state.files.length;
+    renderFiles();
+    toast(`${d.file.direction === 'in' ? '📥' : '📤'} ${d.file.filename}`, 'success');
+  } else if(d.type === 'typing') {
+    if(d.active) {
+      typing[d.peer] = Date.now();
+      setTimeout(() => {
+        delete typing[d.peer];
+        renderTyping();
+      }, 6000);
+    } else {
+      delete typing[d.peer];
+    }
+    renderTyping();
+  } else if(d.type === 'status_update') {
+    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    if(m) { m.status = d.status; renderMessages(); }
+  } else if(d.type === 'read_receipt') {
+    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    if(m) { m.status = 'read'; m.read_at = d.read_at; renderMessages(); }
+  } else if(d.type === 'reaction') {
+    const m = state.messages.find(x => x.msg_id === d.msg_id);
+    if(m) {
+      if(!m.reactions) m.reactions = [];
+      if(d.action === 'add') {
+        if(!m.reactions.find(r => r.peer_pubkey === d.peer && r.emoji === d.emoji))
+          m.reactions.push({peer_pubkey: d.peer, emoji: d.emoji});
+      } else {
+        m.reactions = m.reactions.filter(r => !(r.peer_pubkey === d.peer && r.emoji === d.emoji));
+      }
+      renderMessages();
+    }
+  }
+}
+
+// ─── Render ──────────────────────────────────────────────────────────────────
+function render() {
+  $('myKey').textContent = state.public_key || '';
+  $('myFp').textContent = state.fingerprint || '';
+  $('statFriends').textContent = state.friends.length;
+  $('statOnline').textContent = state.online.length;
+  $('statSessions').textContent = Object.keys(state.sessions||{}).length;
+  $('statFiles').textContent = (state.files||[]).length;
+  renderSidebar();
+  renderMessages();
+  renderSessions();
+  renderFiles();
+  updateSendBtn();
+}
+
+function renderSidebar() {
+  const q = ($('sideSearch').value||'').toLowerCase();
+  const el = $('listSection');
+  el.innerHTML = '';
+
+  if(mode === 'friends') {
+    const friends = state.friends.filter(f =>
+      !q || (f.nickname||'').toLowerCase().includes(q) || f.pubkey.toLowerCase().includes(q)
+    );
+    const addBtn = `<button onclick="toggleAdd()" title="Add friend">＋</button>`;
+    const label = document.createElement('div');
+    label.className = 'section-label';
+    label.innerHTML = `<span>Friends (${friends.length})</span>${addBtn}`;
+    el.appendChild(label);
+    if(!friends.length) {
+      el.innerHTML += '<div style="padding:16px;color:var(--text3);font-size:12px;text-align:center">No friends yet — add one above</div>';
+      return;
+    }
+    friends.forEach(f => {
+      const online = state.online.includes(f.pubkey);
+      const secure = !!(state.sessions&&state.sessions[f.pubkey]);
+      const isSelected = selectedTarget?.type === 'friend' && selectedTarget?.id === f.pubkey;
+      const lastMsg = [...state.messages].reverse().find(m =>
+        !m.group_id && (m.sender_pubkey === f.pubkey || m.recipient_pubkey === f.pubkey)
+      );
+      const unread = f.unread || 0;
+      const div = document.createElement('div');
+      div.className = 'friend-item' + (isSelected ? ' active' : '');
+      div.onclick = () => selectFriend(f.pubkey);
+      const bgColor = avatarColor(f.pubkey);
+      div.innerHTML = `
+        <div class="friend-avatar">
+          <div class="avatar-circle" style="background:${bgColor}">${esc(avatarLetter(f.nickname||f.pubkey))}</div>
+          <div class="online-dot ${online?'online':''}"></div>
+        </div>
+        <div class="friend-info">
+          <div class="friend-name">${esc(f.nickname||short(f.pubkey))}</div>
+          <div class="friend-preview">${lastMsg ? esc(lastMsg.body.slice(0,40)) : secure?'🔒 secure session':'no session'}</div>
+        </div>
+        <div class="friend-meta">
+          ${unread ? `<div class="unread-badge">${unread}</div>` : ''}
+          ${secure ? '<div class="secure-tag">🔒</div>' : ''}
+          ${lastMsg ? `<div class="time-tag">${relTime(lastMsg.timestamp)}</div>` : ''}
+        </div>
+      `;
+      el.appendChild(div);
+    });
+  } else {
+    const groups = state.groups.filter(g =>
+      !q || (g.name||'').toLowerCase().includes(q)
+    );
+    const addBtn = `<button onclick="toggleGroup()" title="Create group">＋</button>`;
+    const label = document.createElement('div');
+    label.className = 'section-label';
+    label.innerHTML = `<span>Groups (${groups.length})</span>${addBtn}`;
+    el.appendChild(label);
+    if(!groups.length) {
+      el.innerHTML += '<div style="padding:16px;color:var(--text3);font-size:12px;text-align:center">No groups yet</div>';
+      return;
+    }
+    groups.forEach(g => {
+      const isSelected = selectedTarget?.type === 'group' && selectedTarget?.id === g.group_id;
+      const div = document.createElement('div');
+      div.className = 'friend-item' + (isSelected ? ' active' : '');
+      div.onclick = () => selectGroup(g.group_id);
+      div.innerHTML = `
+        <div class="friend-avatar">
+          <div class="avatar-circle" style="background:#1a3a8f">👥</div>
+        </div>
+        <div class="friend-info">
+          <div class="friend-name">${esc(g.name)}</div>
+          <div class="friend-preview">${(g.members||[]).length} members</div>
+        </div>
+      `;
+      el.appendChild(div);
+    });
+  }
+}
+
+function renderMessages() {
+  const el = $('messages');
+  if(!selectedTarget) return;
+
+  const msgs = (state.messages||[]).filter(m => matchTarget(m));
+  if(!msgs.length) {
+    el.innerHTML = '<div class="empty-state"><div class="emo">🔒</div><h3>No messages yet</h3><p>Send the first encrypted message!</p></div>';
+    return;
+  }
+
+  let html = '';
+  let lastDate = '';
+  let lastSender = '';
+
+  msgs.forEach((m, idx) => {
+    const thisDate = dateLabel(m.timestamp);
+    if(thisDate !== lastDate) {
+      html += `<div class="date-divider">${thisDate}</div>`;
+      lastDate = thisDate;
+      lastSender = '';
+    }
+
+    const isOut = m.direction === 'out';
+    const sameGroup = m.sender_pubkey === lastSender && idx > 0;
+    lastSender = m.sender_pubkey;
+
+    const statusIcon = isOut ? msgStatus(m) : '';
+
+    // Reactions HTML
+    const reactMap = {};
+    (m.reactions||[]).forEach(r => {
+      if(!reactMap[r.emoji]) reactMap[r.emoji] = {count:0, mine:false};
+      reactMap[r.emoji].count++;
+      if(r.peer_pubkey === state.public_key) reactMap[r.emoji].mine = true;
+    });
+    const reactHtml = Object.entries(reactMap).map(([emoji, info]) =>
+      `<span class="reaction-chip ${info.mine?'mine':''}" onclick="toggleReaction('${esc(m.msg_id)}','${esc(m.recipient_pubkey||m.sender_pubkey)}','${emoji}')">${emoji} ${info.count}</span>`
+    ).join('');
+
+    // Image body
+    let bodyHtml;
+    if(m._imgSrc) {
+      bodyHtml = `<img class="msg-image" src="${esc(m._imgSrc)}" onclick="window.open(this.src)" loading="lazy">`;
+    } else {
+      bodyHtml = `<span>${esc(m.body)}</span>`;
+    }
+
+    // Reaction bar
+    const reactionBar = `<div class="reaction-bar">
+      ${['👍','❤️','😂','😮','😢','🔥'].map(e=>`<button class="reaction-btn" onclick="event.stopPropagation();toggleReaction('${esc(m.msg_id)}','${esc(isOut?m.recipient_pubkey:m.sender_pubkey)}','${e}')">${e}</button>`).join('')}
+    </div>`;
+
+    html += `
+      <div class="msg-group ${isOut?'out':'in'}">
+        <div class="msg-bubble" style="${sameGroup?'margin-top:1px':''}">
+          ${reactionBar}
+          ${bodyHtml}
+        </div>
+        ${reactHtml ? `<div class="reactions" style="padding:0 4px">${reactHtml}</div>` : ''}
+        <div class="msg-meta">
+          <span title="${fullTime(m.timestamp)}">${relTime(m.timestamp)}</span>
+          ${statusIcon}
+          ${!isOut && !m.read_at ? `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:10px;padding:0" onclick="markRead('${esc(m.msg_id)}','${esc(m.sender_pubkey)}')">mark read</button>` : ''}
+        </div>
+      </div>
+    `;
+  });
+
+  el.innerHTML = html;
+}
+
+function msgStatus(m) {
+  const s = m.status || '';
+  if(s === 'read') return `<span class="check read" title="Read">✓✓</span>`;
+  if(s === 'delivered_to_peer' || s === 'delivered') return `<span class="check delivered" title="Delivered">✓✓</span>`;
+  if(s === 'sent_to_relay') return `<span class="check" title="Sent">✓</span>`;
+  return `<span style="font-size:10px;color:var(--text3)" title="Sending">🕐</span>`;
+}
+
+function renderTyping() {
+  const el = $('typing-indicator');
+  const target = selectedTarget;
+  if(!target || target.type !== 'friend') { el.innerHTML = ''; return; }
+  if(typing[target.id]) {
+    const f = state.friends.find(x=>x.pubkey===target.id);
+    const name = f?.nickname || short(target.id);
+    el.innerHTML = `<span style="color:var(--text2);font-size:12px">${esc(name)} is typing</span><div class="typing-dots"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>`;
+  } else {
+    el.innerHTML = '';
+  }
+}
+
+function renderSessions() {
+  const el = $('sessionList');
+  const entries = Object.entries(state.sessions||{});
+  if(!entries.length) {
+    el.innerHTML = '<span class="muted" style="font-size:12px">No sessions yet</span>';
+    return;
+  }
+  const SESSION_TTL = 86400;
+  el.innerHTML = entries.map(([peer, s]) => {
+    const f = state.friends.find(x=>x.pubkey===peer);
+    const name = f?.nickname || short(peer);
+    const pct = Math.min(100, Math.round((s.expires_in/SESSION_TTL)*100));
+    const cls = pct > 50 ? '' : pct > 20 ? 'warn' : 'danger';
+    const expiresLabel = s.expires_in > 3600
+      ? `${Math.floor(s.expires_in/3600)}h remaining`
+      : s.expires_in > 60
+      ? `${Math.floor(s.expires_in/60)}m remaining`
+      : `Expired`;
+    return `<div class="session-item">
+      <div class="session-item-name">${esc(name)}</div>
+      <div class="session-item-meta">${short(peer)}</div>
+      <div class="session-age">
+        <span style="font-size:10px;color:var(--text3)">${expiresLabel}</span>
+        <div class="bar"><div class="fill ${cls}" style="width:${pct}%"></div></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderFiles() {
+  const el = $('fileList');
+  if(!state.files.length) {
+    el.innerHTML = '<span class="muted" style="font-size:12px">No files yet</span>';
+    return;
+  }
+  el.innerHTML = state.files.slice(0,10).map(f => `
+    <div class="file-item">
+      <div class="file-icon">${fileIcon(f.filename)}</div>
+      <div class="file-info">
+        <div class="file-name" title="${esc(f.filename)}">${esc(f.filename)}</div>
+        <div class="file-meta">${fmt(f.size)} · ${relTime(f.uploaded_at)}</div>
+      </div>
+      <a class="file-dl" href="/files/${f.file_id}" download title="Download">⬇</a>
+    </div>
+  `).join('');
+}
+
+function renderChatHeader() {
+  const el = $('chatHeader');
+  if(!selectedTarget) {
+    el.innerHTML = '<div style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:13px">← Select a friend or group to start chatting</div>';
+    return;
+  }
+  if(selectedTarget.type === 'friend') {
+    const f = state.friends.find(x=>x.pubkey===selectedTarget.id);
+    const name = f?.nickname || short(selectedTarget.id);
+    const online = state.online.includes(selectedTarget.id);
+    const secure = !!(state.sessions&&state.sessions[selectedTarget.id]);
+    const bgColor = avatarColor(selectedTarget.id);
+    el.innerHTML = `
+      <div class="chat-header-avatar" style="background:${bgColor}">${esc(avatarLetter(f?.nickname||selectedTarget.id))}</div>
+      <div class="chat-header-info">
+        <div class="chat-header-name">${esc(name)}</div>
+        <div class="chat-header-sub">
+          ${online?'🟢 Online':'⚫ Offline'} · ${secure?'🔒 Secure session':'🔓 No session'}
+          ${f?.last_seen?` · Last seen ${relTime(f.last_seen)}`:''}
+        </div>
+      </div>
+      <div class="chat-header-actions">
+        ${!secure?`<button class="btn btn-primary btn-sm" onclick="connectPeer()">Connect</button>`:''}
+        <button class="btn btn-secondary btn-sm" onclick="removeFriend('${esc(selectedTarget.id)}')">Remove</button>
+      </div>
+    `;
+  } else {
+    const g = state.groups.find(x=>x.group_id===selectedTarget.id);
+    const name = g?.name || 'Group';
+    el.innerHTML = `
+      <div class="chat-header-avatar">👥</div>
+      <div class="chat-header-info">
+        <div class="chat-header-name">${esc(name)}</div>
+        <div class="chat-header-sub">${(g?.members||[]).length} members · encrypted fan-out</div>
+      </div>
+    `;
+  }
+}
+
+// ─── Selection ────────────────────────────────────────────────────────────────
+function selectFriend(pubkey) {
+  selectedTarget = {type:'friend', id:pubkey};
+  delete typing[pubkey];
+  renderTyping();
+  renderSidebar();
+  renderChatHeader();
+  renderMessages();
+  scrollBottom(true);
+  send({type:'clear_unread', pubkey});
+  updateSendBtn();
+  // Request browser notification permission lazily
+  if(Notification.permission === 'default') Notification.requestPermission();
+}
+
+function selectGroup(group_id) {
+  selectedTarget = {type:'group', id:group_id};
+  renderSidebar();
+  renderChatHeader();
+  renderMessages();
+  scrollBottom(true);
+  updateSendBtn();
+}
+
+function matchTarget(m) {
+  if(!selectedTarget) return false;
+  if(selectedTarget.type === 'group') return m.group_id === selectedTarget.id;
+  return !m.group_id && (m.sender_pubkey === selectedTarget.id || m.recipient_pubkey === selectedTarget.id);
+}
+
+// ─── Mode ─────────────────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  $('tabFriends').className = 'mode-tab' + (m==='friends'?' active':'');
+  $('tabGroups').className  = 'mode-tab' + (m==='groups' ?' active':'');
+  selectedTarget = null;
+  renderSidebar();
+  renderChatHeader();
+  renderMessages();
+  updateSendBtn();
+}
+
+// ─── Actions ──────────────────────────────────────────────────────────────────
+function toggleId() {
+  const k = $('myKey'), a = $('idActions');
+  const show = !k.classList.contains('visible');
+  k.classList.toggle('visible', show);
+  a.style.display = show ? 'flex' : 'none';
+}
+
+function copyKey() {
+  navigator.clipboard.writeText(state.public_key||'').then(()=>toast('Public key copied','success'));
+}
+
+function toggleAdd() {
+  const p = $('addPanel');
+  p.classList.toggle('open');
+  if(p.classList.contains('open')) $('friendKey').focus();
+}
+
+function toggleGroup() {
+  const p = $('groupPanel');
+  p.classList.toggle('open');
+  if(p.classList.contains('open')) $('groupName').focus();
+}
+
+function addFriend() {
+  const pk = $('friendKey').value.trim(), nick = $('friendName').value.trim();
+  if(!pk) return;
+  send({type:'add_friend', pubkey:pk, nickname:nick||undefined});
+  $('friendKey').value=''; $('friendName').value='';
+  $('addPanel').classList.remove('open');
+  setMode('friends');
+}
+
+function removeFriend(pubkey) {
+  if(!confirm('Remove this friend and their local session?')) return;
+  send({type:'remove_friend', pubkey});
+  selectedTarget = null;
+  renderChatHeader();
+  renderMessages();
+}
+
+function connectPeer() {
+  if(!selectedTarget || selectedTarget.type !== 'friend') return;
+  send({type:'connect', pubkey: selectedTarget.id});
+}
+
+function sendMessage() {
+  const text = $('text').value.trim();
+  if(!text || !selectedTarget) return;
+  if(selectedTarget.type === 'group') {
+    send({type:'send_message', group_id:selectedTarget.id, text});
+  } else {
+    send({type:'send_message', pubkey:selectedTarget.id, text});
+  }
+  $('text').value = '';
+  onTextInput();
+  stopTyping();
+}
+
+function sendFile() {
+  const f = $('fileInput').files[0];
+  if(!f || !selectedTarget) return;
+  if(f.size > 25*1024*1024) { toast('File exceeds 25 MB limit','error'); return; }
+  const r = new FileReader();
+  r.onload = () => {
+    const data = r.result.split(',')[1];
+    if(selectedTarget.type === 'group') {
+      send({type:'send_file', group_id:selectedTarget.id, filename:f.name, data});
+    } else {
+      send({type:'send_file', pubkey:selectedTarget.id, filename:f.name, data});
+    }
+  };
+  r.readAsDataURL(f);
+  $('fileInput').value = '';
+}
+
+function createGroup() {
+  const name = $('groupName').value.trim();
+  const raw = $('groupMembers').value.trim();
+  const members = raw ? raw.split(',').map(s=>s.trim()).filter(Boolean)
+    : (selectedTarget?.type==='friend' ? [selectedTarget.id] : []);
+  send({type:'create_group', name, members});
+  $('groupName').value=''; $('groupMembers').value='';
+  $('groupPanel').classList.remove('open');
+  setMode('groups');
+}
+
+function markRead(msg_id, peer_pubkey) {
+  send({type:'read_receipt', pubkey:peer_pubkey, msg_id});
+}
+
+function toggleReaction(msg_id, peer_pubkey, emoji) {
+  if(!peer_pubkey || peer_pubkey === state.public_key) return;
+  const m = state.messages.find(x=>x.msg_id===msg_id);
+  if(!m) return;
+  const existing = (m.reactions||[]).find(r=>r.peer_pubkey===state.public_key&&r.emoji===emoji);
+  const action = existing ? 'remove' : 'add';
+  send({type:'reaction', pubkey:peer_pubkey, msg_id, emoji, action});
+}
+
+// ─── Typing ───────────────────────────────────────────────────────────────────
+function startTyping() {
+  if(!selectedTarget || selectedTarget.type !== 'friend') return;
+  if(!myTypingActive) {
+    myTypingActive = true;
+    send({type:'typing', pubkey:selectedTarget.id, active:true});
+  }
+  clearTimeout(myTypingTimeout);
+  myTypingTimeout = setTimeout(stopTyping, 3000);
+}
+
+function stopTyping() {
+  if(myTypingActive && selectedTarget?.type==='friend') {
+    myTypingActive = false;
+    send({type:'typing', pubkey:selectedTarget.id, active:false});
+  }
+  clearTimeout(myTypingTimeout);
+}
+
+function onTextInput() {
+  const v = $('text').value;
+  const bytes = new TextEncoder().encode(v).length;
+  $('charHint').textContent = `${bytes.toLocaleString()} / 65,536`;
+  updateSendBtn();
+  autoResize($('text'));
+  if(v.trim()) startTyping(); else stopTyping();
+}
+
+function onTextKey(e) {
+  if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+function autoResize(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+}
+
+function updateSendBtn() {
+  const hasText = !!$('text').value.trim();
+  const hasTarget = !!selectedTarget;
+  $('sendBtn').disabled = !(hasText && hasTarget);
+}
+
+// ─── Scroll ───────────────────────────────────────────────────────────────────
+function scrollBottom(instant) {
+  const el = $('messages');
+  if(instant) el.scrollTop = el.scrollHeight;
+  else setTimeout(() => el.scrollTop = el.scrollHeight, 50);
+}
+
+// ─── Unread ───────────────────────────────────────────────────────────────────
+function bumpUnread(pubkey) {
+  unreadTitle++;
+  updateTitle();
+}
+
+function updateTitle() {
+  document.title = unreadTitle > 0 ? `(${unreadTitle}) ⚛ Quantum Chat` : '⚛ Quantum Chat';
+}
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+function notify(title, body) {
+  if(Notification.permission === 'granted') {
+    try {
+      new Notification(`⚛ ${title}`, {body: body.slice(0,120), icon: ''});
+    } catch(_) {}
+  }
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────────────
+function toast(text, level='info') {
+  const icons = {info:'ℹ️', success:'✅', error:'❌', warning:'⚠️'};
+  const div = document.createElement('div');
+  div.className = `toast ${level}`;
+  div.innerHTML = `<span class="toast-icon">${icons[level]||'ℹ️'}</span><span>${esc(text)}</span>`;
+  $('toasts').appendChild(div);
+  setTimeout(() => div.remove(), 4500);
+}
+
+// ─── Drag & Drop ─────────────────────────────────────────────────────────────
+const mainEl = $('main');
+mainEl.addEventListener('dragover', e => {
+  e.preventDefault();
+  if(selectedTarget) $('dropOverlay').classList.add('active');
+});
+mainEl.addEventListener('dragleave', e => {
+  if(!mainEl.contains(e.relatedTarget)) $('dropOverlay').classList.remove('active');
+});
+mainEl.addEventListener('drop', e => {
+  e.preventDefault();
+  $('dropOverlay').classList.remove('active');
+  if(!selectedTarget) { toast('Select a contact first', 'warning'); return; }
+  const file = e.dataTransfer.files[0];
+  if(!file) return;
+  if(file.size > 25*1024*1024) { toast('File exceeds 25 MB limit', 'error'); return; }
+  const r = new FileReader();
+  r.onload = () => {
+    const data = r.result.split(',')[1];
+    if(selectedTarget.type === 'group')
+      send({type:'send_file', group_id:selectedTarget.id, filename:file.name, data});
+    else
+      send({type:'send_file', pubkey:selectedTarget.id, filename:file.name, data});
+  };
+  r.readAsDataURL(file);
+});
+
+// Focus on window return — clear title unread
+window.addEventListener('focus', () => {
+  unreadTitle = 0;
+  updateTitle();
+});
+
+wsConnect();
 </script>
 </body>
 </html>
 """
 
 
-def start_http(node: QuantumNode, host: str, port: int, ui_ws_port: int = UI_WS_PORT) -> ThreadedHTTPServer:
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+def start_http(node: QuantumNode, host: str, port: int,
+               ui_ws_port: int = UI_WS_PORT) -> ThreadedHTTPServer:
     ChatHTTPHandler.node = node
     ChatHTTPHandler.ui_ws_port = ui_ws_port
     httpd = ThreadedHTTPServer((host, port), ChatHTTPHandler)
@@ -1224,6 +3439,7 @@ async def start_signaling(host: str, port: int) -> None:
     websockets = require_websockets()
     server = SignalingServer()
     async with websockets.serve(server.handle, host, port, max_size=MAX_FILE_BYTES * 2):
+        LOG.info("Signaling server listening on ws://%s:%d", host, port)
         print(f"Signaling server listening on ws://{host}:{port}")
         await asyncio.Future()
 
@@ -1231,11 +3447,18 @@ async def start_signaling(host: str, port: int) -> None:
 async def run_node(args: argparse.Namespace) -> None:
     node = QuantumNode(args.db, args.signaling_url)
     httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port)
-    print(f"{APP_NAME} identity: {node.public_key}")
-    print(f"UI: http://{args.http_host}:{args.http_port}")
+    LOG.info("%s v%s — identity: %s", APP_NAME, VERSION, node.public_key)
+    print(f"{APP_NAME} v{VERSION}")
+    print(f"Identity:  {node.public_key}")
+    print(f"Fingerprint: {key_fingerprint(node.public_key)}")
+    print(f"UI:        http://{args.http_host}:{args.http_port}")
+    print(f"Health:    http://{args.http_host}:{args.http_port}/health")
     if args.open_browser:
         webbrowser.open(f"http://{args.http_host}:{args.http_port}")
-    tasks = [asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)), asyncio.create_task(node.connect_signaling_loop())]
+    tasks = [
+        asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
+        asyncio.create_task(node.connect_signaling_loop()),
+    ]
     if args.with_signaling:
         tasks.append(asyncio.create_task(start_signaling(args.signaling_host, args.signaling_port)))
     try:
@@ -1246,14 +3469,18 @@ async def run_node(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Post-quantum P2P chat")
+    parser = argparse.ArgumentParser(
+        description=f"Quantum Chat v{VERSION} — post-quantum P2P encrypted chat"
+    )
     sub = parser.add_subparsers(dest="command")
-    signal = sub.add_parser("signal", help="run only the signaling/relay server")
-    signal.add_argument("--host", default=SIGNALING_HOST)
-    signal.add_argument("--port", type=int, default=SIGNALING_PORT)
+    signal_cmd = sub.add_parser("signal", help="run only the signaling/relay server")
+    signal_cmd.add_argument("--host", default=SIGNALING_HOST)
+    signal_cmd.add_argument("--port", type=int, default=SIGNALING_PORT)
+
     parser.add_argument("--db", default=DB_FILE)
     parser.add_argument("--signaling-url", default=DEFAULT_SIGNALING_URL)
-    parser.add_argument("--with-signaling", action="store_true", help="also start a local signaling server")
+    parser.add_argument("--with-signaling", action="store_true",
+                        help="also start a local signaling server")
     parser.add_argument("--signaling-host", default=SIGNALING_HOST)
     parser.add_argument("--signaling-port", type=int, default=SIGNALING_PORT)
     parser.add_argument("--http-host", default=HTTP_HOST)
@@ -1261,12 +3488,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--ui-ws-host", default=UI_WS_HOST)
     parser.add_argument("--ui-ws-port", type=int, default=UI_WS_PORT)
     parser.add_argument("--no-browser", dest="open_browser", action="store_false")
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="logging verbosity (default: WARNING)"
+    )
     parser.set_defaults(open_browser=True)
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level, logging.WARNING),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     if args.command == "signal":
         asyncio.run(start_signaling(args.host, args.port))
     else:
