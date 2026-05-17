@@ -1,7 +1,7 @@
 [project]
 name = "quantum-chat"
-version = "0.2.0"
-description = "Post-quantum end-to-end encrypted peer-to-peer chat"
+version = "2.0.0"
+description = "Single-file post-quantum end-to-end encrypted peer-to-peer chat with a browser UI"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
