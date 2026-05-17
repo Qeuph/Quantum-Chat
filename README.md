@@ -7,13 +7,13 @@ Quantum Chat is a single-file, browser-based, post-quantum encrypted peer-to-pee
 ## Features
 
 - **Persistent identity:** your ML-DSA/Dilithium public/private signing key is created once and stored in SQLite.
-- **Trusted friends:** add peers by public key, optionally with a nickname.
+- **Trusted friends:** add peers by public key, optionally with a nickname, and see online/session status at a glance.
 - **Post-quantum session setup:** peers authenticate handshakes with ML-DSA/Dilithium signatures and establish shared secrets with Kyber-512.
 - **Modern symmetric encryption:** every chat message and file payload is encrypted with AES-256-GCM using HKDF-derived session keys.
 - **P2P-style relay:** peers connect to a signaling WebSocket that only routes envelopes; message and file contents remain end-to-end encrypted.
-- **Encrypted files:** files are encrypted in transit, checksum verified on receipt, stored locally, and downloadable from the local UI.
-- **Groups:** create groups and send messages to members by encrypting a separate copy for each member's current pairwise session.
-- **SQLite persistence:** identity, friends, sessions, groups, messages, and file metadata persist across restarts.
+- **Encrypted files:** files are encrypted in transit, checksum verified on receipt, shown in a transfer list, and downloadable from the local UI.
+- **Groups:** create groups from selected or comma-separated members and send messages or files by encrypting a separate copy for each member's current pairwise session.
+- **SQLite persistence:** identity, friends, sessions, groups, messages, files, and session health metadata persist across restarts.
 - **One-file app:** all Python, HTTP serving, WebSocket handling, and the browser UI live in `chat.py`.
 
 ## Requirements
@@ -72,7 +72,18 @@ Each peer then:
 2. Shares it with the other peer through a trusted out-of-band channel.
 3. Adds the other peer in **Friends**.
 4. Clicks **Connect** to complete the Kyber session handshake.
-5. Sends messages or files after the secure session notice appears.
+5. Sends messages or files after the secure session notice appears and the friend shows a secure session badge.
+
+## UI improvements
+
+The local browser interface includes:
+
+- A dashboard for friend, online peer, secure session, and file counts.
+- Friend cards with online and secure-session badges.
+- Target-scoped message history with a quick text filter.
+- A session health panel that shows established pairwise sessions.
+- A recent encrypted files panel with local download links.
+- Group creation from either the selected friend or comma-separated public keys, plus group file fan-out.
 
 ## How it works
 
@@ -136,7 +147,7 @@ files/             # Created at runtime for transferred files
 - Signaling is server-assisted relay, not pure direct WebRTC/TCP hole punching.
 - The relay can see routing metadata (public keys, online status, envelope type), but not encrypted payload contents.
 - Group messages are pairwise fan-out to current group members rather than TreeKEM or MLS.
-- File transfer currently buffers the whole file in memory and is capped at 25 MB by default.
+- File transfer currently buffers the whole file in memory for each recipient and is capped at 25 MB by default.
 - The app is not externally audited and should be reviewed before high-risk deployments.
 
 ## Development checks
@@ -160,7 +171,8 @@ db.add_friend('friend', 'Alice')
 db.create_group('gid', 'Group', 'abc')
 db.add_group_member('gid', 'friend')
 db.save_message('m1', 'abc', 'hello', 'out', recipient='friend', delivered=True)
-print(db.load_identity()[0], db.get_friends()[0]['nickname'], db.groups_for('abc')[0]['name'], db.recent_messages()[0]['body'])
+db.save_file('file1', 'note.txt', 'abc', 5, '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', path, recipient='friend')
+print(db.load_identity()[0], db.get_friends()[0]['nickname'], db.group_details_for('abc')[0]['name'], db.recent_messages()[0]['body'], db.recent_files()[0]['filename'])
 db.close(); os.remove(path)
 PY
 ```

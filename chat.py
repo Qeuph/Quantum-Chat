@@ -20,6 +20,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -29,6 +30,7 @@ import uuid
 import webbrowser
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import quote, urlparse
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -45,6 +47,15 @@ SIGNALING_PORT = 8766
 DEFAULT_SIGNALING_URL = "ws://127.0.0.1:8766"
 MAX_TEXT_BYTES = 64 * 1024
 MAX_FILE_BYTES = 25 * 1024 * 1024
+PENDING_OFFER_TTL = 5 * 60
+HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def validate_public_key(pubkey: str) -> str:
+    value = (pubkey or "").strip().lower()
+    if not value or len(value) % 2 or not HEX_RE.fullmatch(value):
+        raise ValueError("Public key must be a non-empty hexadecimal string")
+    return value
 
 
 def utc_ts() -> int:
@@ -278,6 +289,10 @@ class Database:
     def is_friend(self, pubkey: str) -> bool:
         return self.conn.execute("SELECT 1 FROM friends WHERE pubkey=?", (pubkey,)).fetchone() is not None
 
+    def session_summary(self) -> Dict[str, Dict[str, Any]]:
+        rows = self.conn.execute("SELECT peer_pubkey, session_id, established_at, initiator FROM sessions")
+        return {r["peer_pubkey"]: {"session_id": r["session_id"], "established_at": r["established_at"], "initiator": bool(r["initiator"])} for r in rows}
+
     def touch_friend(self, pubkey: str) -> None:
         self.conn.execute("UPDATE friends SET last_seen=? WHERE pubkey=?", (utc_ts(), pubkey))
         self.conn.commit()
@@ -312,6 +327,12 @@ class Database:
     def group_members(self, group_id: str) -> List[str]:
         return [r["pubkey"] for r in self.conn.execute("SELECT pubkey FROM group_members WHERE group_id=?", (group_id,))]
 
+    def group_details_for(self, pubkey: str) -> List[Dict[str, Any]]:
+        groups = self.groups_for(pubkey)
+        for group in groups:
+            group["members"] = self.group_members(group["group_id"])
+        return groups
+
     def save_message(self, msg_id: str, sender: str, body: str, direction: str, recipient: Optional[str] = None, group_id: Optional[str] = None, delivered: bool = False) -> None:
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (msg_id, sender_pubkey, recipient_pubkey, group_id, body, direction, timestamp, delivered) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -319,9 +340,13 @@ class Database:
         )
         self.conn.commit()
 
-    def recent_messages(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def recent_messages(self, limit: int = 200) -> List[Dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM messages ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,))
         return [dict(r) for r in reversed(rows.fetchall())]
+
+    def recent_files(self, limit: int = 100) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows]
 
     def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str, path: str, recipient: Optional[str] = None, group_id: Optional[str] = None) -> None:
         self.conn.execute(
@@ -392,8 +417,10 @@ class QuantumNode:
             "signaling_url": self.signaling_url,
             "online": sorted(self.online_peers),
             "friends": self.db.get_friends(),
-            "groups": self.db.groups_for(self.public_key),
+            "groups": self.db.group_details_for(self.public_key),
             "messages": self.db.recent_messages(),
+            "files": self.db.recent_files(),
+            "sessions": self.db.session_summary(),
         }
 
     async def send_relay(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
@@ -411,13 +438,23 @@ class QuantumNode:
         envelope = {"kind": data.get("kind"), "payload": data.get("payload")}
         return self.crypto.verify(bytes.fromhex(peer_pubkey), canonical_json(envelope), sig)
 
+    def cleanup_pending_offers(self) -> None:
+        now = utc_ts()
+        expired = [peer for peer, offer in self.pending_offers.items() if now - offer.created_at > PENDING_OFFER_TTL]
+        for peer in expired:
+            self.pending_offers.pop(peer, None)
+
     async def connect_peer(self, peer_pubkey: str) -> None:
+        self.cleanup_pending_offers()
+        peer_pubkey = validate_public_key(peer_pubkey)
+        if peer_pubkey == self.public_key:
+            raise ValueError("You cannot connect to your own public key")
         if not self.db.is_friend(peer_pubkey):
             raise ValueError("Add this public key as a friend before connecting")
         kem_pk, kem_sk = self.crypto.new_kem_keypair()
         session_id = str(uuid.uuid4())
         self.pending_offers[peer_pubkey] = PendingOffer(peer_pubkey, session_id, kem_sk, utc_ts())
-        payload = {"from": self.public_key, "session_id": session_id, "kem_pk": b64e(kem_pk), "created_at": utc_ts()}
+        payload = {"from": self.public_key, "to": peer_pubkey, "session_id": session_id, "kem_pk": b64e(kem_pk), "created_at": utc_ts()}
         await self.send_relay(peer_pubkey, self.signed_payload("session_offer", payload))
         await self.broadcast_ui({"type": "notice", "level": "info", "text": f"Session offer sent to {short_key(peer_pubkey)}"})
 
@@ -428,12 +465,16 @@ class QuantumNode:
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid session offer signature")
         payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Session offer routing metadata mismatch")
+        if utc_ts() - int(payload.get("created_at", 0)) > PENDING_OFFER_TTL:
+            raise ValueError("Session offer expired")
         ciphertext, secret = self.crypto.kem_encapsulate(b64d(payload["kem_pk"]))
         key = self.crypto.derive_session_key(secret, self.public_key, peer_pubkey, payload["session_id"])
         self.sessions[peer_pubkey] = key
         self.db.save_session(peer_pubkey, payload["session_id"], key, initiator=False)
         self.db.touch_friend(peer_pubkey)
-        accept = {"from": self.public_key, "session_id": payload["session_id"], "ciphertext": b64e(ciphertext), "accepted_at": utc_ts()}
+        accept = {"from": self.public_key, "to": peer_pubkey, "session_id": payload["session_id"], "ciphertext": b64e(ciphertext), "accepted_at": utc_ts()}
         await self.send_relay(peer_pubkey, self.signed_payload("session_accept", accept))
         await self.broadcast_ui({"type": "notice", "level": "success", "text": f"Secure session established with {short_key(peer_pubkey)}"})
         await self.broadcast_ui(self.state_payload())
@@ -442,6 +483,8 @@ class QuantumNode:
         if not self.verify_signed(peer_pubkey, data):
             raise ValueError("Invalid session accept signature")
         payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Session accept routing metadata mismatch")
         pending = self.pending_offers.pop(peer_pubkey, None)
         if not pending or pending.session_id != payload["session_id"]:
             raise ValueError("Session accept does not match an active offer")
@@ -454,6 +497,8 @@ class QuantumNode:
         await self.broadcast_ui(self.state_payload())
 
     async def send_chat(self, peer_pubkey: str, text: str, group_id: Optional[str] = None) -> None:
+        peer_pubkey = validate_public_key(peer_pubkey)
+        text = (text or "").strip()
         if not text or len(text.encode()) > MAX_TEXT_BYTES:
             raise ValueError("Message is empty or too large")
         if peer_pubkey not in self.sessions:
@@ -470,6 +515,8 @@ class QuantumNode:
         if peer_pubkey not in self.sessions:
             raise ValueError("Encrypted chat received without a session")
         payload = data["payload"]
+        if payload.get("from") != peer_pubkey or payload.get("to") != self.public_key:
+            raise ValueError("Chat routing metadata mismatch")
         text = self.crypto.decrypt(self.sessions[peer_pubkey], data["packet"], canonical_json(payload)).decode("utf-8")
         self.db.save_message(payload["msg_id"], peer_pubkey, text, "in", recipient=self.public_key, group_id=payload.get("group_id"), delivered=True)
         await self.broadcast_ui({"type": "message", "message": {"msg_id": payload["msg_id"], "sender_pubkey": peer_pubkey, "recipient_pubkey": self.public_key, "group_id": payload.get("group_id"), "body": text, "direction": "in", "timestamp": utc_ts(), "delivered": 1}})
@@ -482,7 +529,20 @@ class QuantumNode:
             if self.db.is_friend(peer):
                 await self.send_chat(peer, text, group_id=group_id)
 
+    async def send_group_file(self, group_id: str, filename: str, encoded: str) -> None:
+        members = set(self.db.group_members(group_id))
+        if self.public_key not in members:
+            raise ValueError("You are not a member of this group")
+        sent = 0
+        for peer in members - {self.public_key}:
+            if self.db.is_friend(peer):
+                await self.send_file(peer, filename, encoded, group_id=group_id)
+                sent += 1
+        if not sent:
+            raise ValueError("No group members with active friend records were available for file delivery")
+
     async def send_file(self, peer_pubkey: str, filename: str, encoded: str, group_id: Optional[str] = None) -> None:
+        peer_pubkey = validate_public_key(peer_pubkey)
         raw = b64d(encoded)
         if len(raw) > MAX_FILE_BYTES:
             raise ValueError(f"File exceeds {MAX_FILE_BYTES // (1024 * 1024)} MB limit")
@@ -490,7 +550,7 @@ class QuantumNode:
             await self.connect_peer(peer_pubkey)
             raise ValueError("Secure session is not ready yet; retry after handshake completes")
         file_id = str(uuid.uuid4())
-        safe_name = os.path.basename(filename) or "download.bin"
+        safe_name = os.path.basename(filename or "") or "download.bin"
         sha = hashlib.sha256(raw).hexdigest()
         Path(FILES_DIR).mkdir(exist_ok=True)
         storage = str(Path(FILES_DIR) / file_id)
@@ -505,13 +565,15 @@ class QuantumNode:
         if peer_pubkey not in self.sessions:
             raise ValueError("Encrypted file received without a session")
         meta = data["payload"]
+        if meta.get("from") != peer_pubkey or meta.get("to") != self.public_key:
+            raise ValueError("File routing metadata mismatch")
         raw = self.crypto.decrypt(self.sessions[peer_pubkey], data["packet"], canonical_json(meta))
         if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
             raise ValueError("File checksum mismatch")
         Path(FILES_DIR).mkdir(exist_ok=True)
         storage = str(Path(FILES_DIR) / meta["file_id"])
         Path(storage).write_bytes(raw)
-        self.db.save_file(meta["file_id"], os.path.basename(meta["filename"]), peer_pubkey, len(raw), meta["sha256"], storage, recipient=self.public_key, group_id=meta.get("group_id"))
+        self.db.save_file(meta["file_id"], os.path.basename(meta.get("filename") or "download.bin"), peer_pubkey, len(raw), meta["sha256"], storage, recipient=self.public_key, group_id=meta.get("group_id"))
         await self.broadcast_ui({"type": "file", "file": {**meta, "direction": "in", "url": f"/files/{meta['file_id']}"}})
 
     async def handle_relay_payload(self, peer_pubkey: str, payload: Dict[str, Any]) -> None:
@@ -525,7 +587,11 @@ class QuantumNode:
         elif kind == "file":
             await self.handle_file(peer_pubkey, payload)
         elif kind == "group_invite":
+            if not self.db.is_friend(peer_pubkey) or not self.verify_signed(peer_pubkey, payload):
+                raise ValueError("Invalid group invite")
             data = payload.get("payload", {})
+            if data.get("from") != peer_pubkey or data.get("to") != self.public_key or self.public_key not in data.get("members", []):
+                raise ValueError("Group invite metadata mismatch")
             self.db.create_group(data["group_id"], data.get("name") or f"Group {data['group_id'][:8]}", self.public_key)
             for member in data.get("members", []):
                 self.db.add_group_member(data["group_id"], member)
@@ -540,10 +606,13 @@ class QuantumNode:
                 typ = msg.get("type")
                 try:
                     if typ == "add_friend":
-                        self.db.add_friend(msg["pubkey"].strip(), msg.get("nickname") or None)
+                        pubkey = validate_public_key(msg["pubkey"])
+                        if pubkey == self.public_key:
+                            raise ValueError("You cannot add your own public key as a friend")
+                        self.db.add_friend(pubkey, (msg.get("nickname") or "").strip() or None)
                         await self.broadcast_ui(self.state_payload())
                     elif typ == "remove_friend":
-                        self.db.remove_friend(msg["pubkey"])
+                        self.db.remove_friend(validate_public_key(msg["pubkey"]))
                         await self.broadcast_ui(self.state_payload())
                     elif typ == "connect":
                         await self.connect_peer(msg["pubkey"])
@@ -553,16 +622,20 @@ class QuantumNode:
                         else:
                             await self.send_chat(msg["pubkey"], msg["text"])
                     elif typ == "send_file":
-                        await self.send_file(msg["pubkey"], msg["filename"], msg["data"], msg.get("group_id"))
+                        if msg.get("group_id"):
+                            await self.send_group_file(msg["group_id"], msg["filename"], msg["data"])
+                        else:
+                            await self.send_file(msg["pubkey"], msg["filename"], msg["data"], msg.get("group_id"))
                     elif typ == "create_group":
                         group_id = str(uuid.uuid4())
-                        name = msg.get("name") or f"Group {group_id[:8]}"
+                        name = (msg.get("name") or "").strip() or f"Group {group_id[:8]}"
                         self.db.create_group(group_id, name, self.public_key)
                         for member in msg.get("members", []):
+                            member = validate_public_key(member)
                             if self.db.is_friend(member):
                                 self.db.add_group_member(group_id, member)
                                 if member in self.sessions:
-                                    invite = {"group_id": group_id, "name": name, "members": self.db.group_members(group_id), "from": self.public_key}
+                                    invite = {"group_id": group_id, "name": name, "members": self.db.group_members(group_id), "from": self.public_key, "to": member}
                                     await self.send_relay(member, self.signed_payload("group_invite", invite))
                         await self.broadcast_ui(self.state_payload())
                     elif typ == "refresh":
@@ -615,11 +688,14 @@ class SignalingServer:
             async for raw in ws:
                 msg = json.loads(raw)
                 if msg.get("type") == "register":
-                    pubkey = msg["pubkey"]
+                    pubkey = validate_public_key(msg["pubkey"])
                     self.clients[pubkey] = ws
                     await self.broadcast_peers()
                 elif msg.get("type") == "relay":
-                    target = msg.get("to")
+                    if not pubkey:
+                        await ws.send(json.dumps({"type": "error", "text": "Register before relaying"}))
+                        continue
+                    target = validate_public_key(msg.get("to", ""))
                     if target in self.clients:
                         await self.clients[target].send(json.dumps({"type": "relay", "from": pubkey, "payload": msg.get("payload")}))
                     else:
@@ -644,7 +720,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self._send(200, body, "text/html; charset=utf-8")
             return
         if self.path.startswith("/files/"):
-            file_id = self.path.rsplit("/", 1)[-1]
+            file_id = urlparse(self.path).path.rsplit("/", 1)[-1]
             meta = self.node.db.get_file(file_id) if self.node else None
             if not meta or not Path(meta["storage_path"]).exists():
                 self.send_error(404, "File not found")
@@ -654,7 +730,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", f'attachment; filename="{meta["filename"]}"')
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(meta['filename'])}")
             self.end_headers()
             self.wfile.write(data)
             return
@@ -679,34 +755,63 @@ HTML = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quantum Chat</title>
 <style>
-:root{color-scheme:dark;--bg:#07111f;--panel:#101d2f;--muted:#91a4bd;--line:#223656;--accent:#69e6a6;--danger:#ff6b81;--warn:#ffd166;--text:#eaf2ff;--blue:#73a7ff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#142545,var(--bg));color:var(--text);font:15px/1.45 Inter,system-ui,Segoe UI,sans-serif}.app{max-width:1200px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:center}.badge{border:1px solid var(--line);padding:6px 10px;border-radius:999px;color:var(--accent)}.grid{display:grid;grid-template-columns:330px 1fr;gap:16px;margin-top:18px}.card{background:rgba(16,29,47,.88);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 12px 30px #0004}.key{font-family:ui-monospace,monospace;word-break:break-all;color:#cfe1ff;background:#07111f;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:104px;overflow:auto}.row{display:flex;gap:8px;margin-top:10px}input,select,textarea{width:100%;background:#07111f;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}button{background:linear-gradient(135deg,#326bff,#715aff);border:0;border-radius:10px;color:#fff;font-weight:700;padding:10px 13px;cursor:pointer}button.secondary{background:#223656}button.danger{background:#7f1d35}.list{display:flex;flex-direction:column;gap:8px;margin-top:10px}.item{border:1px solid var(--line);border-radius:12px;padding:10px;background:#0b1627}.item small{display:block;color:var(--muted);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis}.chat{height:560px;overflow:auto;display:flex;flex-direction:column;gap:10px;background:#07111f;border:1px solid var(--line);border-radius:16px;padding:14px}.msg{max-width:76%;padding:10px 12px;border-radius:14px;background:#162845}.msg.out{align-self:flex-end;background:#214c70}.msg .meta{font-size:12px;color:var(--muted);margin-bottom:4px}.composer{display:grid;grid-template-columns:1fr 140px auto auto;gap:8px;margin-top:12px}.toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px}.toast div{padding:12px 14px;border-radius:12px;background:#15233a;border:1px solid var(--line)}.toast .error{border-color:var(--danger)}.toast .warning{border-color:var(--warn)}.toast .success{border-color:var(--accent)}@media(max-width:850px){.grid{grid-template-columns:1fr}.composer{grid-template-columns:1fr}.top{display:block}}
+:root{color-scheme:dark;--bg:#06101d;--panel:#0f1c2e;--panel2:#13243a;--muted:#96a9c4;--line:#274061;--accent:#67e8a5;--danger:#ff6b81;--warn:#ffd166;--text:#edf5ff;--blue:#79abff}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 18% 0,#203b6c 0,#0a1627 38%,var(--bg) 100%);color:var(--text);font:15px/1.45 Inter,system-ui,Segoe UI,sans-serif}.app{max-width:1360px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.top h1{margin:.1rem 0;font-size:34px}.top p{margin:.25rem 0;color:var(--muted)}.badge{border:1px solid var(--line);padding:7px 12px;border-radius:999px;color:var(--accent);white-space:nowrap}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0}.stat{background:rgba(15,28,46,.85);border:1px solid var(--line);border-radius:16px;padding:12px}.stat b{display:block;font-size:24px}.stat span{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.grid{display:grid;grid-template-columns:340px 1fr 290px;gap:16px}.card{background:rgba(15,28,46,.9);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 12px 30px #0005}.card h3{margin:0 0 10px}.key{font-family:ui-monospace,monospace;word-break:break-all;color:#d2e5ff;background:#07111f;border:1px solid var(--line);border-radius:12px;padding:10px;max-height:112px;overflow:auto}.row{display:flex;gap:8px;margin-top:10px;align-items:center}input,select,textarea{width:100%;background:#07111f;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:10px}button{background:linear-gradient(135deg,#326bff,#715aff);border:0;border-radius:12px;color:#fff;font-weight:750;padding:10px 13px;cursor:pointer}button.secondary{background:#223656}button.danger{background:#7f1d35}button:disabled{opacity:.48;cursor:not-allowed}.list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:330px;overflow:auto}.item{border:1px solid var(--line);border-radius:14px;padding:10px;background:#0b1627;cursor:pointer}.item.active{border-color:var(--accent);box-shadow:0 0 0 1px #67e8a555}.item small{display:block;color:var(--muted);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis}.pill{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:999px;padding:2px 8px;color:var(--muted);font-size:12px}.pill.secure{border-color:var(--accent);color:var(--accent)}.pill.online{border-color:var(--blue);color:var(--blue)}.chat-head{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}.chat{height:565px;overflow:auto;display:flex;flex-direction:column;gap:10px;background:#07111f;border:1px solid var(--line);border-radius:16px;padding:14px}.empty{margin:auto;color:var(--muted);text-align:center}.msg{max-width:76%;padding:10px 12px;border-radius:16px;background:#162845}.msg.out{align-self:flex-end;background:#214c70}.msg .meta{font-size:12px;color:var(--muted);margin-bottom:4px}.composer{display:grid;grid-template-columns:1fr 130px auto auto;gap:8px;margin-top:12px}.hint{color:var(--muted);font-size:12px;margin-top:6px}.files a{color:var(--accent);text-decoration:none}.toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:10}.toast div{padding:12px 14px;border-radius:12px;background:#15233a;border:1px solid var(--line);max-width:420px}.toast .error{border-color:var(--danger)}.toast .warning{border-color:var(--warn)}.toast .success{border-color:var(--accent)}@media(max-width:1100px){.grid{grid-template-columns:330px 1fr}.right{grid-column:1/-1}.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.grid,.stats,.composer{grid-template-columns:1fr}.top{display:block}.app{padding:14px}}
 </style>
 </head>
 <body>
 <div class="app">
-  <div class="top"><div><h1>⚛ Quantum Chat</h1><p>Post-quantum E2EE P2P chat with ML-DSA signatures, Kyber session setup, and AES-256-GCM payload encryption.</p></div><div class="badge" id="status">connecting UI…</div></div>
+  <div class="top"><div><h1>⚛ Quantum Chat</h1><p>Post-quantum end-to-end encrypted chat with friend trust, session health, encrypted files, and group fan-out.</p></div><div class="badge" id="status">connecting UI…</div></div>
+  <section class="stats"><div class="stat"><b id="statFriends">0</b><span>friends</span></div><div class="stat"><b id="statOnline">0</b><span>online</span></div><div class="stat"><b id="statSessions">0</b><span>secure sessions</span></div><div class="stat"><b id="statFiles">0</b><span>files</span></div></section>
   <div class="grid">
     <aside>
-      <div class="card"><h3>Your identity</h3><div class="key" id="myKey">loading…</div><button class="secondary" onclick="copyKey()">Copy public key</button></div>
+      <div class="card"><h3>Your identity</h3><div class="key" id="myKey">loading…</div><div class="row"><button class="secondary" onclick="copyKey()">Copy public key</button><button class="secondary" onclick="refresh()">Refresh</button></div></div>
       <div class="card"><h3>Friends</h3><input id="friendKey" placeholder="Friend public key"><input id="friendName" placeholder="Nickname (optional)" style="margin-top:8px"><div class="row"><button onclick="addFriend()">Add</button><button class="secondary" onclick="connectSelected()">Connect selected</button></div><div class="list" id="friends"></div></div>
-      <div class="card"><h3>Groups</h3><input id="groupName" placeholder="Group name"><button style="margin-top:8px" onclick="createGroup()">Create group with selected friend</button><div class="list" id="groups"></div></div>
+      <div class="card"><h3>Groups</h3><input id="groupName" placeholder="Group name"><input id="groupMembers" placeholder="Member public keys, comma-separated" style="margin-top:8px"><button style="margin-top:8px" onclick="createGroup()">Create group</button><p class="hint">Tip: leave members empty to use the selected friend.</p><div class="list" id="groups"></div></div>
     </aside>
-    <main class="card"><div class="row"><select id="target"></select><button class="secondary" onclick="refresh()">Refresh</button></div><div class="chat" id="chat"></div><div class="composer"><input id="text" placeholder="Type encrypted message…" onkeydown="if(event.key==='Enter')sendMessage()"><select id="mode"><option value="friend">Friend</option><option value="group">Group</option></select><button onclick="sendMessage()">Send</button><label><button type="button" onclick="document.getElementById('file').click()">File</button><input id="file" type="file" hidden onchange="sendFile()"></label></div></main>
+    <main class="card">
+      <div class="chat-head"><div><select id="target"></select><div class="hint" id="targetHint">Choose a friend or group.</div></div><select id="mode"><option value="friend">Friend</option><option value="group">Group</option></select></div>
+      <input id="search" placeholder="Filter visible messages…" style="margin-top:10px" oninput="renderMessages()">
+      <div class="chat" id="chat"></div>
+      <div class="composer"><input id="text" placeholder="Type encrypted message…" oninput="updateComposer()" onkeydown="if(event.key==='Enter'&&!event.shiftKey)sendMessage()"><select id="priority"><option>Normal</option><option>Quiet</option><option>Urgent</option></select><button id="sendBtn" onclick="sendMessage()">Send</button><label><button type="button" onclick="document.getElementById('file').click()">File</button><input id="file" type="file" hidden onchange="sendFile()"></label></div><div class="hint" id="charCount">0 / 65536 bytes</div>
+    </main>
+    <aside class="right">
+      <div class="card"><h3>Session health</h3><div class="list" id="sessions"></div></div>
+      <div class="card files"><h3>Encrypted files</h3><div class="list" id="files"></div></div>
+    </aside>
   </div>
 </div><div class="toast" id="toast"></div>
 <script>
-let ws,state={friends:[],groups:[],messages:[],online:[]},selectedFriend=null;
+let ws,state={friends:[],groups:[],messages:[],files:[],online:[],sessions:{}},selectedFriend=null;
 const UI_WS_PORT = __UI_WS_PORT__;
-function connect(){ws=new WebSocket(`ws://${location.hostname}:${UI_WS_PORT}`);ws.onopen=()=>status('UI connected');ws.onclose=()=>{status('UI disconnected');setTimeout(connect,1500)};ws.onmessage=e=>handle(JSON.parse(e.data));}
-function status(t){document.getElementById('status').textContent=t}
-function handle(d){if(d.type==='state'){state=d;render()}else if(d.type==='notice'){toast(d.text,d.level)}else if(d.type==='message'){state.messages.push(d.message);renderMessages()}else if(d.type==='file'){toast(`File ${d.file.filename} received/sent`,'success')}}
-function render(){document.getElementById('myKey').textContent=state.public_key||'';renderFriends();renderGroups();renderTargets();renderMessages();}
-function renderFriends(){let el=document.getElementById('friends');el.innerHTML='';state.friends.forEach(f=>{let online=state.online.includes(f.pubkey)?'🟢':'⚪';let div=document.createElement('div');div.className='item';div.onclick=()=>{selectedFriend=f.pubkey;document.getElementById('mode').value='friend';renderTargets()};div.innerHTML=`<b>${online} ${f.nickname||short(f.pubkey)}</b><small>${f.pubkey}</small><div class="row"><button onclick="event.stopPropagation();selectedFriend='${f.pubkey}';connectSelected()">Connect</button><button class="danger" onclick="event.stopPropagation();removeFriend('${f.pubkey}')">Remove</button></div>`;el.appendChild(div)});}
-function renderGroups(){let el=document.getElementById('groups');el.innerHTML='';state.groups.forEach(g=>{let div=document.createElement('div');div.className='item';div.onclick=()=>{document.getElementById('mode').value='group';document.getElementById('target').value=g.group_id};div.innerHTML=`<b>${g.name}</b><small>${g.group_id}</small>`;el.appendChild(div)});}
-function renderTargets(){let t=document.getElementById('target'),mode=document.getElementById('mode').value;t.innerHTML='';(mode==='friend'?state.friends:state.groups).forEach(x=>{let o=document.createElement('option');o.value=mode==='friend'?x.pubkey:x.group_id;o.textContent=mode==='friend'?(x.nickname||short(x.pubkey)):x.name;t.appendChild(o)});if(selectedFriend&&mode==='friend')t.value=selectedFriend;}
-function renderMessages(){let el=document.getElementById('chat');el.innerHTML='';state.messages.forEach(m=>{let div=document.createElement('div');div.className='msg '+(m.direction==='out'?'out':'in');div.innerHTML=`<div class="meta">${m.direction==='out'?'You':short(m.sender_pubkey)} · ${new Date((m.timestamp||Date.now()/1000)*1000).toLocaleString()}</div><div></div>`;div.lastChild.textContent=m.body;el.appendChild(div)});el.scrollTop=el.scrollHeight;}
+function $(id){return document.getElementById(id)}
+function connect(){ws=new WebSocket(`ws://${location.hostname}:${UI_WS_PORT}`);ws.onopen=()=>status('UI connected');ws.onclose=()=>{status('UI disconnected · retrying');setTimeout(connect,1500)};ws.onmessage=e=>handle(JSON.parse(e.data));}
+function status(t){$('status').textContent=t}
+function handle(d){if(d.type==='state'){state=d;render()}else if(d.type==='notice'){toast(d.text,d.level)}else if(d.type==='message'){state.messages.push(d.message);renderMessages()}else if(d.type==='file'){state.files.unshift(d.file);renderFiles();toast(`File ${d.file.filename} received/sent`,'success')}}
+function render(){ $('myKey').textContent=state.public_key||'';$('statFriends').textContent=state.friends.length;$('statOnline').textContent=state.online.length;$('statSessions').textContent=Object.keys(state.sessions||{}).length;$('statFiles').textContent=(state.files||[]).length;renderFriends();renderGroups();renderTargets();renderSessions();renderFiles();renderMessages();updateComposer();}
+function renderFriends(){let el=$('friends');el.innerHTML='';state.friends.forEach(f=>{let online=state.online.includes(f.pubkey), secure=state.sessions&&state.sessions[f.pubkey], div=document.createElement('div');div.className='item '+(selectedFriend===f.pubkey?'active':'');div.onclick=()=>{selectedFriend=f.pubkey;$('mode').value='friend';renderTargets();renderFriends();renderMessages()};div.innerHTML=`<b>${online?'🟢':'⚪'} ${escapeHtml(f.nickname||short(f.pubkey))}</b><small>${f.pubkey}</small><div class="row"><span class="pill ${online?'online':''}">${online?'online':'offline'}</span><span class="pill ${secure?'secure':''}">${secure?'secure':'no session'}</span></div><div class="row"><button onclick="event.stopPropagation();selectedFriend='${f.pubkey}';connectSelected()">Connect</button><button class="danger" onclick="event.stopPropagation();removeFriend('${f.pubkey}')">Remove</button></div>`;el.appendChild(div)});if(!state.friends.length)el.innerHTML='<div class="hint">Add a friend public key to start.</div>'}
+function renderGroups(){let el=$('groups');el.innerHTML='';state.groups.forEach(g=>{let div=document.createElement('div');div.className='item';div.onclick=()=>{$('mode').value='group';renderTargets(g.group_id);renderMessages()};div.innerHTML=`<b>${escapeHtml(g.name)}</b><small>${g.group_id}</small><span class="pill">${(g.members||[]).length} members</span>`;el.appendChild(div)});if(!state.groups.length)el.innerHTML='<div class="hint">Create a group for pairwise encrypted fan-out.</div>'}
+function renderTargets(preferred){let t=$('target'),mode=$('mode').value,current=preferred||t.value;t.innerHTML='';let rows=mode==='friend'?state.friends:state.groups;rows.forEach(x=>{let o=document.createElement('option');o.value=mode==='friend'?x.pubkey:x.group_id;o.textContent=mode==='friend'?(x.nickname||short(x.pubkey)):x.name;t.appendChild(o)});if(selectedFriend&&mode==='friend')t.value=selectedFriend;else if(current)t.value=current;let target=currentTarget();$('targetHint').textContent=target?targetHint(target):'No target available yet.';updateComposer();}
+function renderMessages(){let el=$('chat'),target=currentTarget(),q=$('search').value.toLowerCase();el.innerHTML='';let rows=(state.messages||[]).filter(m=>matchesTarget(m,target)).filter(m=>!q||(m.body||'').toLowerCase().includes(q));rows.forEach(m=>{let div=document.createElement('div');div.className='msg '+(m.direction==='out'?'out':'in');div.innerHTML=`<div class="meta">${m.direction==='out'?'You':short(m.sender_pubkey)} · ${new Date((m.timestamp||Date.now()/1000)*1000).toLocaleString()}${m.group_id?' · group':''}</div><div></div>`;div.lastChild.textContent=m.body;el.appendChild(div)});if(!rows.length)el.innerHTML='<div class="empty">No messages for this view yet.</div>';el.scrollTop=el.scrollHeight;}
+function renderSessions(){let el=$('sessions');el.innerHTML='';let entries=Object.entries(state.sessions||{});entries.forEach(([peer,s])=>{let f=state.friends.find(x=>x.pubkey===peer), div=document.createElement('div');div.className='item';div.innerHTML=`<b>${escapeHtml(f?.nickname||short(peer))}</b><small>${peer}</small><span class="pill secure">established ${new Date(s.established_at*1000).toLocaleString()}</span>`;el.appendChild(div)});if(!entries.length)el.innerHTML='<div class="hint">Connect to a friend to establish a secure Kyber session.</div>'}
+function renderFiles(){let el=$('files');el.innerHTML='';(state.files||[]).forEach(f=>{let div=document.createElement('div');div.className='item';div.innerHTML=`<b>${escapeHtml(f.filename)}</b><small>${formatBytes(f.size)} · ${new Date(f.uploaded_at*1000).toLocaleString()}</small><a href="/files/${f.file_id}">Download</a>`;el.appendChild(div)});if(!(state.files||[]).length)el.innerHTML='<div class="hint">Encrypted file transfers appear here.</div>'}
+function currentTarget(){return {mode:$('mode').value,id:$('target').value}}
+function targetHint(t){if(t.mode==='friend'){let f=state.friends.find(x=>x.pubkey===t.id);return f?`${state.online.includes(t.id)?'Online':'Offline'} · ${state.sessions?.[t.id]?'secure session ready':'connect before sending'}`:'Choose a friend.'}let g=state.groups.find(x=>x.group_id===t.id);return g?`${(g.members||[]).length} members · encrypted separately to each reachable member`:'Choose a group.'}
+function matchesTarget(m,t){if(!t.id)return true;if(t.mode==='group')return m.group_id===t.id;return !m.group_id&&(m.sender_pubkey===t.id||m.recipient_pubkey===t.id)}
 function short(k){return k?`${k.slice(0,12)}…${k.slice(-8)}`:''}
-function send(o){ws.send(JSON.stringify(o))}function addFriend(){send({type:'add_friend',pubkey:friendKey.value.trim(),nickname:friendName.value.trim()});friendKey.value='';friendName.value=''}function removeFriend(pubkey){send({type:'remove_friend',pubkey})}function connectSelected(){let pubkey=selectedFriend||target.value||friendKey.value.trim();if(pubkey)send({type:'connect',pubkey})}function sendMessage(){let text=document.getElementById('text').value;if(!text.trim())return;let mode=document.getElementById('mode').value;if(mode==='group')send({type:'send_message',group_id:target.value,text});else send({type:'send_message',pubkey:target.value,text});document.getElementById('text').value=''}function sendFile(){let f=file.files[0];if(!f)return;let r=new FileReader();r.onload=()=>send({type:'send_file',pubkey:target.value,filename:f.name,data:r.result.split(',')[1]});r.readAsDataURL(f);file.value=''}function createGroup(){let members=selectedFriend?[selectedFriend]:[];send({type:'create_group',name:groupName.value.trim(),members})}function refresh(){send({type:'refresh'})}function copyKey(){navigator.clipboard.writeText(state.public_key||'');toast('Copied public key','success')}function toast(t,l='info'){let e=document.createElement('div');e.className=l;e.textContent=t;document.getElementById('toast').appendChild(e);setTimeout(()=>e.remove(),5000)}document.getElementById('mode').onchange=renderTargets;connect();
+function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function formatBytes(n){if(!Number.isFinite(n))return '0 B';let u=['B','KB','MB','GB'],i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`}
+function send(o){if(!ws||ws.readyState!==1){toast('UI socket is not connected yet','warning');return}ws.send(JSON.stringify(o))}
+function addFriend(){send({type:'add_friend',pubkey:$('friendKey').value.trim(),nickname:$('friendName').value.trim()});$('friendKey').value='';$('friendName').value=''}
+function removeFriend(pubkey){if(confirm('Remove this friend and local session?'))send({type:'remove_friend',pubkey})}
+function connectSelected(){let pubkey=selectedFriend||$('target').value||$('friendKey').value.trim();if(pubkey)send({type:'connect',pubkey})}
+function sendMessage(){let text=$('text').value;if(!text.trim())return;let t=currentTarget();if(t.mode==='group')send({type:'send_message',group_id:t.id,text});else send({type:'send_message',pubkey:t.id,text});$('text').value='';updateComposer()}
+function sendFile(){let f=$('file').files[0],t=currentTarget();if(!f||!t.id)return;let r=new FileReader();r.onload=()=>{let data=r.result.split(',')[1];if(t.mode==='group')send({type:'send_file',group_id:t.id,filename:f.name,data});else send({type:'send_file',pubkey:t.id,filename:f.name,data})};r.readAsDataURL(f);$('file').value=''}
+function createGroup(){let typed=$('groupMembers').value.split(',').map(x=>x.trim()).filter(Boolean),members=typed.length?typed:(selectedFriend?[selectedFriend]:[]);send({type:'create_group',name:$('groupName').value.trim(),members});$('groupName').value='';$('groupMembers').value=''}
+function refresh(){send({type:'refresh'})}
+function copyKey(){navigator.clipboard.writeText(state.public_key||'');toast('Copied public key','success')}
+function updateComposer(){let bytes=new TextEncoder().encode($('text').value).length;$('charCount').textContent=`${bytes} / 65536 bytes`;$('sendBtn').disabled=!$('text').value.trim()||!$('target').value}
+function toast(t,l='info'){let e=document.createElement('div');e.className=l;e.textContent=t;$('toast').appendChild(e);setTimeout(()=>e.remove(),5500)}
+$('mode').onchange=()=>{renderTargets();renderMessages()};$('target').onchange=()=>{if($('mode').value==='friend')selectedFriend=$('target').value;renderMessages();renderTargets()};connect();
 </script>
 </body>
 </html>
