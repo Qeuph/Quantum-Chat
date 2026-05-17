@@ -2,7 +2,7 @@
 
 Quantum Chat is a single-file, browser-based, post-quantum encrypted peer-to-peer chat application. It includes a local web UI, a local UI WebSocket API, an optional WebSocket signaling/relay server, SQLite persistence, encrypted file transfer, friend management, and small group fan-out.
 
-> **Security note:** this project uses post-quantum primitives through `pqcrypto`, but it has not been independently audited. Treat it as production-oriented application code, not a certified secure messenger.
+> **Security note:** this project uses post-quantum primitives through `pqcrypto`, but it has not been independently audited. Treat it as hardened experimental application code, not a certified secure messenger. Remote production deployments still need an external security review, TLS, operational monitoring, and a clear key-backup plan.
 
 ## Features
 
@@ -13,7 +13,10 @@ Quantum Chat is a single-file, browser-based, post-quantum encrypted peer-to-pee
 - **P2P-style relay:** peers connect to a signaling WebSocket that only routes envelopes; message and file contents remain end-to-end encrypted.
 - **Encrypted files:** files are encrypted in transit, checksum verified on receipt, shown in a transfer list, and downloadable from the local UI.
 - **Groups:** create groups from selected or comma-separated members and send messages or files by encrypting a separate copy for each member's current pairwise session.
-- **SQLite persistence:** identity, friends, sessions, groups, messages, files, and session health metadata persist across restarts.
+- **SQLite persistence:** identity, friends, sessions, groups, messages, files, and session health metadata persist across restarts. Secret keys, session keys, message bodies, and local file bytes are encrypted at rest with a per-database local master key file.
+- **Local UI protection:** the browser UI WebSocket requires a random startup token and rejects non-local origins.
+- **Replay hardening:** inbound chat/file payloads include counters and duplicate IDs are ignored before UI broadcast.
+- **Delivery status:** receivers send signed delivery acknowledgements after successful decrypt and persistence.
 - **One-file app:** all Python, HTTP serving, WebSocket handling, and the browser UI live in `chat.py`.
 
 ## Requirements
@@ -142,13 +145,44 @@ quantum_chat.db    # Created at runtime
 files/             # Created at runtime for transferred files
 ```
 
-## Current limits
+## Threat model and current limits
+
+Quantum Chat aims to protect message and file contents from the signaling relay and passive network observers. It assumes users verify friend public keys through a trusted out-of-band channel and that invited group members are trusted to receive group content.
+
+Important remaining limits:
 
 - Signaling is server-assisted relay, not pure direct WebRTC/TCP hole punching.
 - The relay can see routing metadata (public keys, online status, envelope type), but not encrypted payload contents.
-- Group messages are pairwise fan-out to current group members rather than TreeKEM or MLS.
+- Group messages are pairwise fan-out to current group members rather than TreeKEM or MLS. Group epochs and roles are stored, but membership changes are not yet a full MLS-style group ratchet.
 - File transfer currently buffers the whole file in memory for each recipient and is capped at 25 MB by default.
+- Local at-rest encryption uses a random `*.db.key` file beside the database. Protect and back up this key file; an attacker who steals both the database/files and key file can decrypt local data.
 - The app is not externally audited and should be reviewed before high-risk deployments.
+
+## Security hardening added in this version
+
+- Strict algorithm-sized public-key validation for friends, relay registration, and relay targets.
+- Signed signaling registration challenges to reduce public-key hijacking on the relay.
+- Basic relay rate limiting and payload shape checks.
+- UI WebSocket bearer token and local-origin checks.
+- HTTP security headers for the app shell and downloads.
+- SQLite schema versioning, busy timeout, indexes, and serialized database access.
+- Encrypted-at-rest identity keys, session keys, message bodies, and downloaded/sent file bytes.
+- Replay protections using message/file counters plus insert-only duplicate handling.
+- Signed delivery acknowledgements and persisted message status fields.
+
+## Packaging and development
+
+Install as an editable package with development tools:
+
+```bash
+python -m pip install -e .[dev]
+```
+
+Run the console entry point:
+
+```bash
+quantum-chat --with-signaling
+```
 
 ## Development checks
 
@@ -158,20 +192,27 @@ Compile the app:
 python -m py_compile chat.py
 ```
 
+Run automated tests:
+
+```bash
+pytest
+```
+
 Exercise the database layer without network services:
 
 ```bash
 python - <<'PY'
 from chat import Database
-import tempfile, os
+import tempfile, os, uuid
 fd, path = tempfile.mkstemp(); os.close(fd); os.remove(path)
 db = Database(path)
+file_id = str(uuid.uuid4())
 db.save_identity('abc', b'secret')
 db.add_friend('friend', 'Alice')
 db.create_group('gid', 'Group', 'abc')
 db.add_group_member('gid', 'friend')
 db.save_message('m1', 'abc', 'hello', 'out', recipient='friend', delivered=True)
-db.save_file('file1', 'note.txt', 'abc', 5, '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', path, recipient='friend')
+db.save_file(file_id, 'note.txt', 'abc', 5, '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', path, recipient='friend')
 print(db.load_identity()[0], db.get_friends()[0]['nickname'], db.group_details_for('abc')[0]['name'], db.recent_messages()[0]['body'], db.recent_files()[0]['filename'])
 db.close(); os.remove(path)
 PY
@@ -179,4 +220,4 @@ PY
 
 ## License
 
-MIT License. See your repository license file if present.
+MIT License. See [LICENSE](LICENSE).
