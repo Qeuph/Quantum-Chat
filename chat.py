@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -873,6 +874,7 @@ class Database:
             aad = (f"message:{d['msg_id']}:{d['sender_pubkey']}:"
                    f"{d.get('recipient_pubkey') or ''}:{d.get('group_id') or ''}").encode()
             d["body"] = self.decrypt_blob(raw_b, d.get("body_nonce"), aad).decode("utf-8")
+            d.pop("body_nonce", None)
             out.append(d)
         return out
 
@@ -943,7 +945,12 @@ class Database:
             rows = self.conn.execute(
                 "SELECT * FROM files ORDER BY uploaded_at DESC LIMIT ?", (limit,)
             )
-            return [dict(r) for r in rows]
+            files = []
+            for r in rows:
+                d = dict(r)
+                d.pop("file_nonce", None)
+                files.append(d)
+            return files
 
     def save_file(self, file_id: str, filename: str, sender: str, size: int, sha256: str,
                   path: str, recipient: Optional[str] = None, group_id: Optional[str] = None,
@@ -1782,16 +1789,19 @@ class QuantumNode:
     # ── UI WebSocket ──────────────────────────────────────────────────────────
 
     def _ui_authenticated(self, ws: Any) -> bool:
-        path = getattr(ws, "path", "/") or "/"
+        request = getattr(ws, "request", None)
+        path = getattr(request, "path", None) or getattr(ws, "path", "/") or "/"
         token = parse_qs(urlparse(path).query).get("token", [""])[0]
         if not secrets.compare_digest(token, self.ui_token):
             return False
         origin = None
-        headers = getattr(ws, "request_headers", None)
+        headers = getattr(request, "headers", None) or getattr(ws, "request_headers", None)
         if headers:
             origin = headers.get("Origin")
         if origin:
             host = (urlparse(origin).hostname or "").lower()
+            if not host:
+                return False
             if host not in {"127.0.0.1", "localhost", "::1"} and not getattr(self, "allow_remote_ui", False):
                 return False
         return True
@@ -4171,6 +4181,19 @@ def _is_local_host(host: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
+async def _cleanup_runtime_tasks(tasks: List[Any]) -> None:
+    pending: List[asyncio.Task[Any]] = []
+    for task in tasks:
+        if isinstance(task, asyncio.Task):
+            if not task.done():
+                task.cancel()
+                pending.append(task)
+        elif inspect.iscoroutine(task):
+            task.close()
+    if pending:
+        await asyncio.wait(pending)
+
+
 async def run_node(args: argparse.Namespace) -> None:
     if (not _is_local_host(args.http_host) or not _is_local_host(args.ui_ws_host)) and not args.allow_remote_ui:
         raise SystemExit("Refusing to expose the UI on a non-local interface without --allow-remote-ui")
@@ -4204,6 +4227,7 @@ async def run_node(args: argparse.Namespace) -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
+        await _cleanup_runtime_tasks(tasks)
         httpd.shutdown()
         node.db.close()
 
