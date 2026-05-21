@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import tempfile
@@ -69,6 +70,40 @@ def test_database_encrypts_identity_session_and_message_at_rest():
                 os.remove(path + suffix)
             except FileNotFoundError:
                 pass
+
+
+def test_state_payload_is_json_serializable_with_encrypted_rows():
+    pytest.importorskip("cryptography")
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    os.remove(path)
+    try:
+        db = Database(path, master_key=b"k" * 32)
+        db.save_message("m1", "aa", "hello", "out", recipient="bb")
+        db.save_file(
+            str(uuid.uuid4()), "hello.txt", "aa", 5, "f" * 64, "/tmp/hello.txt",
+            recipient="bb", file_nonce=b"nonce"
+        )
+        node = SimpleNamespace(
+            public_key="aa",
+            signaling_url="ws://127.0.0.1:8766",
+            online_peers=set(),
+            relay_alias="relay",
+            direct_url=None,
+            db=db,
+        )
+        payload = __import__("chat").QuantumNode.state_payload(node)
+        json.dumps(payload)
+        assert "body_nonce" not in payload["messages"][0]
+        assert "file_nonce" not in payload["files"][0]
+        db.close()
+    finally:
+        for suffix in ["", "-wal", "-shm"]:
+            try:
+                os.remove(path + suffix)
+            except FileNotFoundError:
+                pass
+
 
 def test_replay_window_accepts_out_of_order_and_rejects_duplicates():
     pytest.importorskip("cryptography")
@@ -149,6 +184,30 @@ def test_remote_mode_csp_includes_dynamic_host():
     csp = headers["Content-Security-Policy"]
     assert "ws://chat.example.com:8443" in csp
     assert "wss://chat.example.com:8443" in csp
+
+
+def test_ui_auth_accepts_modern_websockets_request_shape():
+    node = SimpleNamespace(ui_token="token123", allow_remote_ui=False)
+    ws = SimpleNamespace(
+        request=SimpleNamespace(
+            path="/?token=token123",
+            headers={"Origin": "http://127.0.0.1:8000"},
+        )
+    )
+    import chat
+    assert chat.QuantumNode._ui_authenticated(node, ws) is True
+
+
+def test_ui_auth_accepts_legacy_websockets_request_shape_and_rejects_remote_origin():
+    node = SimpleNamespace(ui_token="token123", allow_remote_ui=False)
+    ws = SimpleNamespace(
+        path="/?token=token123",
+        request_headers={"Origin": "http://chat.example.com"},
+    )
+    import chat
+    assert chat.QuantumNode._ui_authenticated(node, ws) is False
+    node.allow_remote_ui = True
+    assert chat.QuantumNode._ui_authenticated(node, ws) is True
 
 
 def test_remote_mode_ui_url_prints_token(monkeypatch):
