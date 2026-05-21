@@ -2119,7 +2119,7 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if path != "/" and self.require_http_auth and not self._http_authenticated(parsed):
+        if self.require_http_auth and not self._http_authenticated(parsed):
             self.send_error(401, "Unauthorized")
             return
 
@@ -2174,13 +2174,23 @@ class ChatHTTPHandler(BaseHTTPRequestHandler):
         return bool(expected and (secrets.compare_digest(token, expected) or secrets.compare_digest(bearer, expected)))
 
     def _security_headers(self, download: bool = False) -> None:
+        connect_src = "connect-src 'self' ws://127.0.0.1:* ws://localhost:* ws://[::1]:* wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;"
+        if self.require_http_auth:
+            host = (self.headers.get("Host", "") or "").strip()
+            if host:
+                host = host.split("/", 1)[0]
+                connect_src = (
+                    f"connect-src 'self' ws://{host} wss://{host} "
+                    "ws://127.0.0.1:* ws://localhost:* ws://[::1]:* "
+                    "wss://127.0.0.1:* wss://localhost:* wss://[::1]:*;"
+                )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
-            "connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
+            f"{connect_src} "
             "style-src 'unsafe-inline' 'self'; "
             "script-src 'unsafe-inline' 'self'; "
             "img-src 'self' data: blob:; "
@@ -4170,16 +4180,19 @@ async def run_node(args: argparse.Namespace) -> None:
         direct_url = f"ws://{advertised_host}:{args.direct_port}"
     node = QuantumNode(args.db, args.signaling_url, direct_url=direct_url, enable_direct=args.enable_direct)
     node.allow_remote_ui = args.allow_remote_ui
+    ui_url = f"http://{args.http_host}:{args.http_port}"
+    if args.allow_remote_ui:
+        ui_url = f"{ui_url}?token={quote(node.ui_token)}"
     httpd = start_http(node, args.http_host, args.http_port, args.ui_ws_port,
                        require_http_auth=args.allow_remote_ui)
     LOG.info("%s v%s — identity: %s", APP_NAME, VERSION, node.public_key)
     print(f"{APP_NAME} v{VERSION}")
     print(f"Identity:  {node.public_key}")
     print(f"Fingerprint: {key_fingerprint(node.public_key)}")
-    print(f"UI:        http://{args.http_host}:{args.http_port}")
+    print(f"UI:        {ui_url}")
     print(f"Health:    http://{args.http_host}:{args.http_port}/health")
     if args.open_browser:
-        webbrowser.open(f"http://{args.http_host}:{args.http_port}")
+        webbrowser.open(ui_url)
     tasks = [
         asyncio.create_task(start_ui_ws(node, args.ui_ws_host, args.ui_ws_port)),
         asyncio.create_task(node.connect_signaling_loop()),
